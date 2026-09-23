@@ -2,12 +2,14 @@
 # Batch counterpart to run_wrapping.sh: runs run_pipeline_batch.py, which
 # sweeps every capture at label status "unreviewed" (or an explicit
 # --captures list), wrapping each capture's neutral frame (bootstrap +
-# skin-augmented) and -- if run_neutral_propagation_batch.sh already
-# produced propagated landmarks for it -- every propagated expression frame
-# too, one run_pipeline.py subprocess per capture. Also fires the automatic
-# keyline-video step (run_wrapping.sh's single-capture path doesn't -- that's
-# a batch-only feature since it renders every wrapped frame for a capture
-# once all of them are done).
+# skin-augmented) FIRST, then -- unless --neutral-only is passed -- every
+# other decoder/frame_list.csv frame that run_neutral_propagation_batch.sh
+# has already produced landmark data for (frames without landmarks yet are
+# skipped, not failed). One run_pipeline.py subprocess per FRAME (not per
+# capture) -- pass --segments/--max-frames-per-segment to restrict the sweep.
+# Also fires the automatic keyline-video step (run_wrapping.sh's
+# single-capture path doesn't -- that's a batch-only feature since it renders
+# every wrapped frame for a capture once all of them are done).
 #
 # HANDOFF: every path below is an environment variable with the value
 # currently used on THIS cluster as its default -- override any of them by

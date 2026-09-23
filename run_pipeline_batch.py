@@ -1,15 +1,29 @@
 #!/usr/bin/env python3
-"""Batch/sweep wrapper for run_pipeline.py. Simpler than FaceScape's
-run_pipeline_batch.py -- no neutral-first two-pass ordering is needed, since
-there's exactly one wrap target per Ava-256 capture (the neutral frame
-itself), not many expressions chaining off a shared neutral.
+"""Batch/sweep wrapper for run_pipeline.py. Unlike FaceScape's own
+run_pipeline_batch.py (many expressions chaining off one shared neutral, see
+wrap_script/run_pipeline_batch_all.py), Ava-256 has exactly one capture-level
+neutral frame but potentially hundreds/thousands of other frames in
+decoder/frame_list.csv -- this script wraps the capture's neutral frame
+FIRST (required: its wrapped mesh is the source _build_propagated_target_
+correspondence()/face_ray_masking need for every other frame, see
+run_pipeline.py), then, on success, loops through every remaining frame_list.csv
+frame and wraps each one too (skipping any frame run_neutral_skin_propagation.py
+hasn't produced landmark data for yet), one run_pipeline.py subprocess per
+frame -- mirroring wrap_script/run_pipeline_batch_all.py's per-pair frame loop,
+but simpler: Ava-256 expression frames no longer pay their own SAM/U2Net pass
+at all (run_pipeline.py now reuses the neutral frame's own face_ray_mask.json
+by default -- see its own module docstring), so there's no need for that
+script's in-process/shared-segmentation-model refactor here; a subprocess per
+frame is cheap enough as-is.
 
 Usage:
-    python3 run_pipeline_batch.py [--captures ID ...] [--parallel N] [--gpu-ids 0 1 ...] [--dry-run]
+    python3 run_pipeline_batch.py [--captures ID ...] [--parallel N] [--gpu-ids 0 1 ...]
+        [--segments SEG_ID ...] [--max-frames-per-segment N] [--neutral-only] [--dry-run]
 """
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import subprocess
@@ -63,7 +77,11 @@ POLL_INTERVAL_SECONDS = 60
 @dataclass
 class CaptureResult:
     capture_id: str
-    passed: bool
+    passed: bool  # neutral-frame wrap succeeded (or was already done) -- gates keyline video, same meaning as before
+    frames_total: int = 0
+    frames_wrapped: int = 0
+    frames_failed: int = 0
+    frames_skipped_no_landmarks: int = 0
 
 
 def discover_unreviewed_captures(ava256_data_root: Path, label_tracker_path: Path) -> list[str]:
@@ -76,9 +94,35 @@ def discover_unreviewed_captures(ava256_data_root: Path, label_tracker_path: Pat
     ]
 
 
-def process_capture(capture_id: str, root_flags: list[str], log_dir: Path | None, gpu_id: str | None, dry_run: bool) -> CaptureResult:
-    tag = f"[capture={capture_id}]" + (f" gpu={gpu_id}" if gpu_id is not None else "")
+def read_segments(actor_dir: Path) -> dict[str, list[str]]:
+    """seg_id -> ordered list of zero-padded 6-digit frame_ids, in
+    frame_list.csv's own row order. Duplicated from run_neutral_skin_
+    propagation.read_segments() rather than imported -- that module pulls in
+    torch/CoTracker at import time just for this one small CSV-reading
+    function, which this lightweight subprocess-dispatch script has no other
+    reason to depend on."""
+    path = actor_dir / "decoder" / "frame_list.csv"
+    segments: dict[str, list[str]] = {}
+    with path.open("r", encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            seg_id = row["seg_id"]
+            frame_id = row["frame_id"].strip().zfill(6)
+            segments.setdefault(seg_id, []).append(frame_id)
+    return segments
+
+
+def _run_pipeline_once(
+    capture_id: str, frame_id: str | None, root_flags: list[str],
+    log_dir: Path | None, gpu_id: str | None, dry_run: bool,
+) -> bool:
+    """Runs one run_pipeline.py subprocess -- the capture's neutral frame if
+    frame_id is None, else that specific --frame override. Returns whether it
+    succeeded (exit code 0, which also covers run_pipeline.py's own "already
+    wrapped, skipping" idempotency no-op)."""
+    tag = f"[capture={capture_id}" + (f" frame={frame_id}]" if frame_id else "]") + (f" gpu={gpu_id}" if gpu_id is not None else "")
     cmd = [sys.executable, str(PIPELINE_SCRIPT), capture_id, *root_flags]
+    if frame_id is not None:
+        cmd += ["--frame", frame_id]
     if dry_run:
         cmd.append("--dry-run")
     print("RUN  " + " ".join(cmd) + f"  {tag}")
@@ -92,14 +136,69 @@ def process_capture(capture_id: str, root_flags: list[str], log_dir: Path | None
         returncode = subprocess.run(cmd, env=job_env).returncode
     else:
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / f"{capture_id}.log"
+        log_name = f"{capture_id}.log" if frame_id is None else f"{capture_id}_{frame_id}.log"
+        log_path = log_dir / log_name
         with log_path.open("w") as log_file:
             returncode = subprocess.run(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=job_env).returncode
 
     if returncode != 0:
         print(f"FAIL {tag}: exit_code={returncode}")
+        return False
+    return True
+
+
+def process_capture(
+    capture_id: str, root_flags: list[str], log_dir: Path | None, gpu_id: str | None, dry_run: bool, args,
+) -> CaptureResult:
+    """Wraps capture_id's neutral frame first (required -- every other
+    frame's target correspondence and face-ray-mask reuse depends on its
+    wrapped_mesh.obj/face_ray_mask.json already existing, see run_pipeline.py).
+    On success, unless --neutral-only was given, loops through every other
+    frame_list.csv frame and wraps it too -- skipped (not failed) if
+    run_neutral_skin_propagation.py hasn't produced any landmark data for it
+    yet (mirrors wrap_script/run_pipeline_batch_all.py's own pre-flight
+    skin_landmarks_complete() gate)."""
+    neutral_ok = _run_pipeline_once(capture_id, None, root_flags, log_dir, gpu_id, dry_run)
+    if not neutral_ok:
         return CaptureResult(capture_id, passed=False)
-    return CaptureResult(capture_id, passed=True)
+
+    result = CaptureResult(capture_id, passed=True)
+    if args.neutral_only:
+        return result
+
+    import mesh_utils
+    import neutral_frame as neutral_frame_module
+
+    ava256_data_root = Path(args.ava256_data_root)
+    ava256_landmark_root = Path(args.ava256_landmark_root)
+    actor_dir = mesh_utils.resolve_capture_dir(ava256_data_root, capture_id)
+    neutral = neutral_frame_module.resolve_neutral_frame(capture_id, actor_dir, ava256_landmark_root)
+    neutral_frame_id = neutral["frame_id"]
+
+    segments = read_segments(actor_dir)
+    if args.segments:
+        segments = {seg: frames for seg, frames in segments.items() if seg in args.segments}
+    if args.max_frames_per_segment:
+        segments = {seg: frames[: args.max_frames_per_segment] for seg, frames in segments.items()}
+    frame_ids = [fid for frames in segments.values() for fid in frames if fid != neutral_frame_id]
+
+    capture_landmark_dir = ava256_landmark_root / capture_id
+    for frame_id in frame_ids:
+        result.frames_total += 1
+        if not next(capture_landmark_dir.glob(f"*_{frame_id}.json"), None):
+            result.frames_skipped_no_landmarks += 1
+            continue
+        ok = _run_pipeline_once(capture_id, frame_id, root_flags, log_dir, gpu_id, dry_run)
+        if ok:
+            result.frames_wrapped += 1
+        else:
+            result.frames_failed += 1
+
+    print(
+        f"[capture={capture_id}] frames: total={result.frames_total} wrapped={result.frames_wrapped} "
+        f"failed={result.frames_failed} skipped_no_landmarks={result.frames_skipped_no_landmarks}"
+    )
+    return result
 
 
 def render_capture_keyline_video(capture_id: str, args) -> None:
@@ -154,7 +253,7 @@ def render_capture_keyline_video(capture_id: str, args) -> None:
     )
 
 
-def run_sweep(args, root_flags: list[str]) -> tuple[int, int]:
+def run_sweep(args, root_flags: list[str]) -> tuple[int, int, int, int, int]:
     if args.captures:
         captures = args.captures
     else:
@@ -162,21 +261,25 @@ def run_sweep(args, root_flags: list[str]) -> tuple[int, int]:
 
     if not captures:
         print("No captures to process.")
-        return 0, 0
+        return 0, 0, 0, 0, 0
 
     passed = failed = 0
+    frames_wrapped = frames_failed = frames_skipped = 0
     with ThreadPoolExecutor(max_workers=max(1, args.parallel)) as executor:
         futures = {
             executor.submit(
                 process_capture, capture_id, root_flags,
                 Path(args.log_dir) if args.log_dir else None,
                 args.gpu_ids[i % len(args.gpu_ids)] if args.gpu_ids else None,
-                args.dry_run,
+                args.dry_run, args,
             ): capture_id
             for i, capture_id in enumerate(captures)
         }
         for future in as_completed(futures):
             result = future.result()
+            frames_wrapped += result.frames_wrapped
+            frames_failed += result.frames_failed
+            frames_skipped += result.frames_skipped_no_landmarks
             if result.passed:
                 passed += 1
                 if not args.no_video and not args.dry_run:
@@ -186,7 +289,7 @@ def run_sweep(args, root_flags: list[str]) -> tuple[int, int]:
                         print(f"WARNING: keyline video failed for {result.capture_id}: {exc}")
             else:
                 failed += 1
-    return passed, failed
+    return passed, failed, frames_wrapped, frames_failed, frames_skipped
 
 
 def main() -> int:
@@ -220,6 +323,14 @@ def main() -> int:
     parser.add_argument("--gpu-ids", nargs="+", default=None)
     parser.add_argument("--log-dir", default=None)
     parser.add_argument("--poll", action="store_true", help="Loop forever, re-sweeping every %ds (default: one-shot)" % POLL_INTERVAL_SECONDS)
+    parser.add_argument("--segments", nargs="+", default=None,
+                         help="Restrict the post-neutral frame sweep to these seg_ids only (same convention as "
+                              "run_neutral_skin_propagation.py's own --segments)")
+    parser.add_argument("--max-frames-per-segment", type=int, default=None,
+                         help="Cap frames wrapped per segment in the post-neutral frame sweep (debug/testing)")
+    parser.add_argument("--neutral-only", action="store_true",
+                         help="Wrap only each capture's neutral frame, skipping the frame_list.csv sweep "
+                              "(restores this script's old, pre-frame-loop behavior)")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -250,17 +361,23 @@ def main() -> int:
     if args.force:
         root_flags.append("--force")
 
-    total_passed = total_failed = 0
+    total_passed = total_failed = total_frames_wrapped = total_frames_failed = total_frames_skipped = 0
     while True:
-        passed, failed = run_sweep(args, root_flags)
+        passed, failed, frames_wrapped, frames_failed, frames_skipped = run_sweep(args, root_flags)
         total_passed += passed
         total_failed += failed
-        print(f"Sweep complete: {passed} passed, {failed} failed")
+        total_frames_wrapped += frames_wrapped
+        total_frames_failed += frames_failed
+        total_frames_skipped += frames_skipped
+        print(
+            f"Sweep complete: {passed} capture(s) passed, {failed} failed; "
+            f"frames: {frames_wrapped} wrapped, {frames_failed} failed, {frames_skipped} skipped (no landmarks yet)"
+        )
         if not args.poll:
             break
         time.sleep(POLL_INTERVAL_SECONDS)
 
-    return 2 if total_failed else 0
+    return 2 if (total_failed or total_frames_failed) else 0
 
 
 if __name__ == "__main__":
