@@ -302,23 +302,20 @@ def compute_face_ray_mask(
     right_cameras: set[str],
     left_cameras: set[str],
     pot_rows_by_index: dict[int, list[float]] | None = None,
-    save_weights_path: Path | None = None,
-) -> list[int]:
+    return_raw_weights: bool = False,
+) -> list[int] | dict[int, float]:
     """Returns the final face-index list (already intersected with
     facescape_mask.txt and eroded) to use as the skin-augmented wrap's
-    FaceMask restriction. If save_weights_path is given, the raw (pre-
-    threshold) face_idx -> cumulative_weight dict is also dumped there as
-    JSON right after the camera vote loop -- lets a caller inspect/re-
-    threshold the continuous signal without a second full SAM/U2Net run
-    (see render_face_ray_mask_heatmap.py for the same data via a different,
-    return-instead-of-continue code path). If pot_rows_by_index is given,
-    the ear/nose landmark regions are forcefully unioned back in after
-    erosion -- see _force_include_region_faces(). Also, if given, its
-    nosebridge landmark
-    (index 57 -- above where even a full beard/mustache reaches) is
-    reprojected into each camera and used as that camera's SAM point-prompt
-    instead of U2Net's person-centroid heuristic -- see _get_face_mask's own
-    docstring for why (bearded actors: that centroid lands on the beard)."""
+    FaceMask restriction. If pot_rows_by_index is given, the ear/nose
+    landmark regions are forcefully unioned back in after erosion -- see
+    _force_include_region_faces().
+
+    HEATMAP FORK: if return_raw_weights=True, short-circuits right after the
+    per-camera vote-accumulation loop and returns the raw face_idx ->
+    cumulative_weight dict instead -- the CONTINUOUS signal MIN_WEIGHT/
+    facescape_mask.txt/erosion/force-include normally collapse into a single
+    binary include/exclude decision. This is what render_face_ray_mask_
+    heatmap.py actually visualizes."""
     import camera_utils  # local import
     import mesh_utils  # local import: only needed for the prompt-anchor point_hints below
 
@@ -331,14 +328,10 @@ def compute_face_ray_mask(
     camera_weights = {c: 1.0 for c in front_cameras}
     camera_weights.update({c: 1.0 for c in (right_cameras | left_cameras)})  # was 1.5 -- testing uniform weighting
 
-    # Two SAM prompt anchors, not one: nosebridge (idx 57, upper face --
-    # above where even a full beard/mustache reaches) AND chin tip (idx 50,
-    # keypoints_3d id 7 -- lower face). Multi-point prompts anchor SAM's
-    # mask to span the full face instead of clustering tightly around a
-    # single point; each is projected and bounds-checked independently per
-    # camera below, so a camera only loses one anchor (not the whole hint)
-    # if just one of the two projects outside its frame.
-    prompt_anchor_indices = [idx for idx in (57,) if pot_rows_by_index is not None and idx in pot_rows_by_index]  # nosebridge only
+    # Two SAM prompt anchors: nosebridge (idx 57, upper face) + chin tip
+    # (idx 50, keypoints_3d id 7, lower face) -- see face_ray_masking_
+    # ava256.py's own copy of this comment for the full rationale.
+    prompt_anchor_indices = [idx for idx in (57, 50) if pot_rows_by_index is not None and idx in pot_rows_by_index]
     prompt_anchor_xyzs = {
         idx: mesh_utils.pot_row_world_xyz(wrapped_mesh_verts, wrapped_mesh_faces, pot_rows_by_index[idx])
         for idx in prompt_anchor_indices
@@ -363,14 +356,9 @@ def compute_face_ray_mask(
             K_cam, Rt_cam = camera_params[cam_id]
             for anchor_xyz in prompt_anchor_xyzs.values():
                 px, py = camera_utils.project_points(anchor_xyz[None, :], K_cam, Rt_cam)[0]
-                # project_points() is in ORIGINAL image scale -- seg_input is
-                # half-resolution, so scale down to match.
                 hint_x, hint_y = int(round(px * seg_w / orig_w)), int(round(py * seg_h / orig_h))
                 if 0 <= hint_x < seg_w and 0 <= hint_y < seg_h:
                     point_hints.append((hint_x, hint_y))
-                # else: this anchor projects outside this camera's frame
-                # (occluded/facing away) -- just skip it, keep whichever
-                # other anchor(s) are still in-frame.
 
         mask = _get_face_mask(seg_input, point_hints=point_hints).astype(np.uint8)
         num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
@@ -476,11 +464,10 @@ def compute_face_ray_mask(
         print(f"  face_ray_masking cam={cam_id} weight={cam_weight} cumulative_faces_hit={len(face_to_weight)} "
               f"(angle_rejected={angle_rejected} occlusion_rejected={occlusion_rejected})")
 
-    if save_weights_path is not None:
-        Path(save_weights_path).write_text(
-            json.dumps({str(k): v for k, v in face_to_weight.items()}), encoding="utf-8"
-        )
-        print(f"Saved raw per-face weights ({len(face_to_weight)} faces) -> {save_weights_path}")
+    if return_raw_weights:
+        print(f"Returning raw per-face weights for {len(face_to_weight)}/{num_faces} faces "
+              f"(max weight={max(face_to_weight.values()) if face_to_weight else 0.0}) -- heatmap mode")
+        return face_to_weight
 
     hit_faces = {face_idx for face_idx, weight in face_to_weight.items() if weight >= MIN_WEIGHT}
     print(f"Faces with cumulative weight >= {MIN_WEIGHT}: {len(hit_faces)} out of {num_faces}")

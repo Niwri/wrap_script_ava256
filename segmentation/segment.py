@@ -105,16 +105,26 @@ class FaceSegmentation:
 
         self.predictor = SamPredictor(self.sam)
 
-    def get_face_mask(self, image, point=None, show_plot=False):
-        """Returns SAM's boolean face mask (HxW), prompted from a single point.
+    def get_face_mask(self, image, point=None, points=None, show_plot=False):
+        """Returns SAM's boolean face mask (HxW), prompted from one or more
+        points (all treated as positive/foreground).
 
-        point: (x, y) pixel to prompt SAM with. Defaults to the image center.
+        point: (x, y) pixel to prompt SAM with (single-point case). Defaults
+            to the image center if neither `point` nor `points` given.
+        points: list of (x, y) pixels for a multi-point prompt (e.g.
+            nosebridge + chin tip, so the mask spans the full face rather
+            than clustering around just one anchor) -- takes priority over
+            `point` if both are given.
         """
         h, w = image.shape[:2]
-        if point is None:
-            point = (w // 2, h // 2)
-        input_point = np.array([point])
-        input_label = np.array([1])
+        if points is not None:
+            input_point = np.array(points)
+            input_label = np.ones(len(points), dtype=int)
+        else:
+            if point is None:
+                point = (w // 2, h // 2)
+            input_point = np.array([point])
+            input_label = np.array([1])
 
         self.predictor.set_image(image)
 
