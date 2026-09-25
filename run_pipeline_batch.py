@@ -29,6 +29,7 @@ import os
 import subprocess
 import sys
 import time
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -82,6 +83,7 @@ class CaptureResult:
     frames_wrapped: int = 0
     frames_failed: int = 0
     frames_skipped_no_landmarks: int = 0
+    skipped: bool = False  # no face mask yet -- not a failure, left for propagation
 
 
 def discover_unreviewed_captures(ava256_data_root: Path, label_tracker_path: Path) -> list[str]:
@@ -157,15 +159,12 @@ def process_capture(
     frame_list.csv frame and wraps it too -- skipped (not failed) if
     run_neutral_skin_propagation.py hasn't produced any landmark data for it
     yet (mirrors wrap_script/run_pipeline_batch_all.py's own pre-flight
-    skin_landmarks_complete() gate)."""
-    neutral_ok = _run_pipeline_once(capture_id, None, root_flags, log_dir, gpu_id, dry_run)
-    if not neutral_ok:
-        return CaptureResult(capture_id, passed=False)
+    skin_landmarks_complete() gate).
 
-    result = CaptureResult(capture_id, passed=True)
-    if args.neutral_only:
-        return result
-
+    Skipped (not failed) when the capture has no neutral face_ray_mask.json
+    yet -- run_neutral_skin_propagation.py computes it. When every frame
+    wrapped cleanly, the capture is moved to 'unconfirmed' here (each
+    run_pipeline.py call gets --no-mark-unconfirmed)."""
     import mesh_utils
     import neutral_frame as neutral_frame_module
 
@@ -174,6 +173,20 @@ def process_capture(
     actor_dir = mesh_utils.resolve_capture_dir(ava256_data_root, capture_id)
     neutral = neutral_frame_module.resolve_neutral_frame(capture_id, actor_dir, ava256_landmark_root)
     neutral_frame_id = neutral["frame_id"]
+
+    face_mask_path = Path(args.ava256_output_root) / capture_id / neutral_frame_id / "face_ray_mask.json"
+    if not face_mask_path.exists():
+        print(f"SKIP [capture={capture_id}]: no face mask at {face_mask_path} -- "
+              "run run_neutral_skin_propagation.py (or its --mask-only) first")
+        return CaptureResult(capture_id, passed=False, skipped=True)
+
+    neutral_ok = _run_pipeline_once(capture_id, None, root_flags, log_dir, gpu_id, dry_run)
+    if not neutral_ok:
+        return CaptureResult(capture_id, passed=False)
+
+    result = CaptureResult(capture_id, passed=True)
+    if args.neutral_only:
+        return result
 
     segments = read_segments(actor_dir)
     if args.segments:
@@ -198,6 +211,12 @@ def process_capture(
         f"[capture={capture_id}] frames: total={result.frames_total} wrapped={result.frames_wrapped} "
         f"failed={result.frames_failed} skipped_no_landmarks={result.frames_skipped_no_landmarks}"
     )
+    if not dry_run and result.frames_failed == 0:
+        tracker = Ava256LabelTracker(Path(args.label_tracker_path))
+        if tracker.mark_unconfirmed(capture_id) is None:
+            print(f"NOTE: not moving {capture_id} to 'unconfirmed' -- current status is {tracker.get_status(capture_id)!r}")
+        else:
+            print(f"[capture={capture_id}] marked 'unconfirmed'")
     return result
 
 
@@ -212,7 +231,7 @@ def render_capture_keyline_video(capture_id: str, args) -> None:
     import mesh_utils
     import neutral_frame as neutral_frame_module
     import render_wrapped_landmarks
-    import face_ray_masking_ava256
+    import camera_classify  # torch-free (face_ray_masking_ava256 imports torch)
     import camera_utils
 
     ava256_data_root = Path(args.ava256_data_root)
@@ -234,7 +253,7 @@ def render_capture_keyline_video(capture_id: str, args) -> None:
 
     camera_ids = camera_utils.load_all_camera_ids(actor_dir)
     camera_params = {cid: camera_utils.load_camera(actor_dir, cid) for cid in camera_ids}
-    front, _right, _left = face_ray_masking_ava256.classify_front_right_left(
+    front, _right, _left = camera_classify.classify_front_right_left(
         verts_world, faces, pot_rows_by_index, camera_ids, camera_params,
     )
     if not front:
@@ -251,6 +270,30 @@ def render_capture_keyline_video(capture_id: str, args) -> None:
         ava256_output_root=ava256_output_root,
         line_renders_root=Path(args.line_renders_root),
     )
+
+
+def render_capture_point_overlay_video(capture_id: str, args) -> None:
+    """Post-capture step next to render_capture_keyline_video(): one
+    landmark point-overlay video (annotated vs. wrapped-mesh landmarks, see
+    point_overlay.py) across every wrapped frame of the capture, written to
+    point_overlay.DEFAULT_OUTPUT_ROOT on the capture's most frontal camera."""
+    import mesh_utils
+    import neutral_frame as neutral_frame_module
+    import point_overlay
+    import render_wrapped_landmarks
+
+    roots = dict(
+        ava256_data_root=Path(args.ava256_data_root),
+        ava256_output_root=Path(args.ava256_output_root),
+        ava256_landmark_root=Path(args.ava256_landmark_root),
+    )
+    actor_dir = mesh_utils.resolve_capture_dir(roots["ava256_data_root"], capture_id)
+    neutral = neutral_frame_module.resolve_neutral_frame(capture_id, actor_dir, roots["ava256_landmark_root"])
+    camera_id = point_overlay.front_camera_id(capture_id, **roots)
+    frame_ids = render_wrapped_landmarks.list_wrapped_frames_in_capture_order(
+        actor_dir, roots["ava256_output_root"], capture_id, neutral_frame_id=neutral["frame_id"],
+    )
+    point_overlay.render_point_overlay_video(capture_id, frame_ids, camera_id, **roots)
 
 
 def run_sweep(args, root_flags: list[str]) -> tuple[int, int, int, int, int]:
@@ -287,7 +330,11 @@ def run_sweep(args, root_flags: list[str]) -> tuple[int, int, int, int, int]:
                         render_capture_keyline_video(result.capture_id, args)
                     except Exception as exc:  # noqa: BLE001 -- a video-render failure shouldn't fail the whole sweep
                         print(f"WARNING: keyline video failed for {result.capture_id}: {exc}")
-            else:
+                    try:
+                        render_capture_point_overlay_video(result.capture_id, args)
+                    except Exception as exc:  # noqa: BLE001 -- same policy as the keyline video
+                        print(f"WARNING: point overlay video failed for {result.capture_id}: {exc}")
+            elif not result.skipped:
                 failed += 1
     return passed, failed, frames_wrapped, frames_failed, frames_skipped
 
@@ -360,6 +407,8 @@ def main() -> int:
         root_flags.append("--no-face-ray-masking")
     if args.force:
         root_flags.append("--force")
+    # This script marks each capture 'unconfirmed' itself, after its frames.
+    root_flags.append("--no-mark-unconfirmed")
 
     total_passed = total_failed = total_frames_wrapped = total_frames_failed = total_frames_skipped = 0
     while True:

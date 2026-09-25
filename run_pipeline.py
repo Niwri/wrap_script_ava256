@@ -301,23 +301,25 @@ def run_pipeline(
     face_ray_mask_path_override: Path | None = None,
     dry_run: bool = False,
     force: bool = False,
+    mark_unconfirmed: bool = True,
 ) -> Path:
+    """Wraps one frame of a capture (CPU only: Wrap + numpy). Face ray
+    masking is not done here: a skin-augmented wrap (include_skin, masking on)
+    uses the capture's own neutral-frame face_ray_mask.json, which
+    run_neutral_skin_propagation.py computes, and raises if it doesn't exist
+    yet. The bootstrap wrap (include_skin=False) and use_face_ray_masking=False
+    use the static facescape_mask.txt. mark_unconfirmed=False leaves the
+    capture's label alone (propagation's own second neutral wrap, and
+    run_pipeline_batch.py, which marks the capture after all its frames)."""
     ensure_roots(landmark_root=ava256_landmark_root, output_root=ava256_output_root, label_tracker_path=label_tracker_path)
     wrap_mesh, default_neutral_mesh_path, wrap_script_module = _load_wrap_script(wrap_script_path)
     # Same monkeypatch pattern as FACE_MASK_PATH below -- a fresh module
     # instance from this call's own _load_wrap_script(), safe to mutate.
     wrap_script_module.TEMPLATE_PATH = Path(template_wrap_path)
     wrap_script_module.NERSEMBLE_BLENDSHAPE_ROOT = Path(blendshape_root)
-    # Portability: module-level constants with no CLI flag upstream of this
-    # script (see DEFAULTS' own comment above). face_ray_masking_ava256 is a
-    # cheap import (SAM/U2Net themselves load lazily inside it) -- safe to
-    # import + patch here even for --no-skin/bootstrap runs that never
-    # actually call compute_face_ray_mask().
-    import face_ray_masking_ava256
-    face_ray_masking_ava256.WRAP_SCRIPT_DIR = Path(wrap_script_dir)
-    face_ray_masking_ava256.FACESCAPE_MASK_PATH = Path(facescape_mask_path)
-    face_ray_masking_ava256.SAM_CHECKPOINT_PATH = Path(sam_checkpoint_path) if sam_checkpoint_path else None
-    face_ray_masking_ava256.U2NET_CHECKPOINT_PATH = Path(u2net_checkpoint_path) if u2net_checkpoint_path else None
+    # (sam_checkpoint_path / u2net_checkpoint_path / wrap_script_dir are
+    # accepted for existing callers but unused here -- face ray masking lives
+    # in run_neutral_skin_propagation.py now.)
     mesh_utils.FACESCAPE_RUN_PIPELINE_PATH = Path(facescape_run_pipeline_path)
     # python-dotenv's load_dotenv() (called inside wrap_mesh()) does not
     # override an already-set env var by default, so setting these here
@@ -333,19 +335,20 @@ def run_pipeline(
     frame_id = frame_id_override or neutral["frame_id"]
     is_neutral_frame = frame_id == neutral["frame_id"]
 
-    # Default (not override): for any non-neutral frame, transparently reuse
-    # the capture's own neutral-frame face_ray_mask.json instead of paying a
-    # fresh SAM/U2Net pass per expression frame -- the visible/occluded face
-    # region is a property of the actor's face geometry + camera rig, not the
-    # specific expression (see the face-ray-masking block below for the full
-    # rationale). Explicit --face-ray-mask-path still wins if the caller
-    # passed one. Falls through to the existing fresh-compute/static-mask
-    # behavior if the neutral frame hasn't been skin-augmented-wrapped yet
-    # (its face_ray_mask.json doesn't exist on disk).
-    if not is_neutral_frame and face_ray_mask_path_override is None:
+    # Every skin-augmented wrap -- the neutral frame's own included -- uses the
+    # capture's neutral-frame face_ray_mask.json (computed once by
+    # run_neutral_skin_propagation.py): the visible face region is a property
+    # of the actor's face + camera rig, not of the expression. An explicit
+    # --face-ray-mask-path still wins.
+    if face_ray_mask_path_override is None:
         neutral_face_ray_mask_path = ava256_output_root / capture_id / neutral["frame_id"] / "face_ray_mask.json"
         if neutral_face_ray_mask_path.exists():
             face_ray_mask_path_override = neutral_face_ray_mask_path
+    if include_skin and use_face_ray_masking and face_ray_mask_path_override is None:
+        raise RuntimeError(
+            f"no face mask for {capture_id} ({ava256_output_root / capture_id / neutral['frame_id'] / 'face_ray_mask.json'}) "
+            f"-- run run_neutral_skin_propagation.py (or its --mask-only) for this capture first"
+        )
 
     output_dir = ava256_output_root / capture_id / frame_id
 
@@ -445,16 +448,8 @@ def run_pipeline(
                 json.dump(target_points, f)
 
         if dry_run:
-            if include_skin and use_face_ray_masking and face_ray_mask_path_override is not None:
+            if include_skin and use_face_ray_masking:
                 face_mask_note = f"would reuse face_ray_mask at {face_ray_mask_path_override}"
-            elif include_skin and use_face_ray_masking and prior_wrap_verts is not None:
-                face_mask_note = "would compute face_ray_masking fresh (SAM/U2Net -- no neutral-frame face_ray_mask.json found to reuse)"
-            elif include_skin and use_face_ray_masking:
-                face_mask_note = (
-                    "WARNING: no neutral-frame face_ray_mask.json AND no prior wrap of this frame to rasterize "
-                    "against -- would SILENTLY fall back to the static facescape_mask.txt (wrap the neutral frame's "
-                    "skin-augmented pass first to avoid this)"
-                )
             elif include_skin:
                 face_mask_note = "face ray masking disabled (--no-face-ray-masking) -- would fall back to the static facescape_mask.txt"
             else:
@@ -466,80 +461,12 @@ def run_pipeline(
             )
             return wrapped_mesh_path
 
-        # 2.5) Face ray masking -- only for the subsequent (skin-augmented)
-        # wrap, using the bootstrap wrap's own mesh, per the user's explicit
-        # instruction: no need on the keypoints_3d-only first wrap, since
-        # there's no "prior wrap" mesh to rasterize/ray-cast against yet.
-        if include_skin and use_face_ray_masking and face_ray_mask_path_override is not None:
-            # Reuse an already-computed face_ray_mask.json instead of
-            # recomputing SAM/U2Net from scratch -- the visible/occluded face
-            # region from this actor's camera rig is a property of their face
-            # geometry and the rig, not of the specific expression, so it
-            # doesn't meaningfully change frame to frame within one capture.
-            # Typically the capture's own neutral-frame skin-augmented wrap's
-            # face_ray_mask.json (already the EXCLUDED-polarity file wrap_mesh()
-            # expects, written by the block below when it computes fresh).
+        # 2.5) Face mask: the capture's own face_ray_mask.json (checked above)
+        # for a skin-augmented wrap; otherwise wrap_script_module's default,
+        # the static facescape_mask.txt.
+        if include_skin and use_face_ray_masking:
             wrap_script_module.FACE_MASK_PATH = Path(face_ray_mask_path_override)
-            print(f"Reusing precomputed face_ray_mask at {face_ray_mask_path_override} for {capture_id}/{frame_id}'s wrap.")
-        elif include_skin and use_face_ray_masking and prior_wrap_verts is not None:
-            import face_ray_masking_ava256
-
-            camera_ids = camera_utils.load_all_camera_ids(actor_dir)
-            camera_params = {cid: camera_utils.load_camera(actor_dir, cid) for cid in camera_ids}
-            pot_rows_by_index = {i: row for i, row in enumerate(pot_rows)}
-
-            # face_ray_masking rasterizes against REAL camera K/Rt (world
-            # scale), so undo the dynamic transform on the prior wrap's
-            # vertices first -- they're in the small FLAME-comparable frame
-            # (wrap_mesh() was fed the transformed scan/correspondence above).
-            prior_wrap_verts_world = dynamic_transform.untransform(prior_wrap_verts, transform_params)
-
-            print(f"Running face_ray_masking for {capture_id}/{frame_id} (using the bootstrap wrap's mesh)...")
-            front_cams, right_cams, left_cams = face_ray_masking_ava256.classify_front_right_left(
-                prior_wrap_verts_world, flame_faces, pot_rows_by_index, camera_ids, camera_params,
-            )
-            face_mask_indices = face_ray_masking_ava256.compute_face_ray_mask(
-                prior_wrap_verts_world, flame_faces, actor_dir, frame_id, camera_ids, camera_params,
-                front_cams, right_cams, left_cams, pot_rows_by_index=pot_rows_by_index,
-            )
-            # FaceForm/Wrap4D's SelectPolygons (FaceMask) node treats its
-            # selection/fileName content as the EXCLUDED set, not included
-            # (confirmed this session against template.wrap's own node graph
-            # and by the user directly) -- compute_face_ray_mask() returns
-            # the INCLUDED set, so write the complement, matching the same
-            # fix already applied to face_ray_masking_ava256._reference_hit_faces().
-            num_flame_faces = flame_faces.shape[0]
-            face_mask_excluded = sorted(set(range(num_flame_faces)) - set(face_mask_indices))
-            face_ray_mask_path = output_dir / "face_ray_mask.json"
-            with face_ray_mask_path.open("w", encoding="utf-8") as f:
-                json.dump(face_mask_excluded, f)
-            # Included-set kept too, purely for later inspection/rendering --
-            # never read by wrap_mesh() itself.
-            with (output_dir / "face_ray_mask_included.json").open("w", encoding="utf-8") as f:
-                json.dump(face_mask_indices, f)
-            # Overrides the module-level FACE_MASK_PATH global that wrap_mesh()'s
-            # own FaceMask-node wiring reads at call time -- safe: wrap_script_module
-            # is a fresh exec'd module instance from THIS call's _load_wrap_script(),
-            # not the shared wrap_script_facescape/run_wrap_script.py file itself or
-            # any other process's copy of it.
-            wrap_script_module.FACE_MASK_PATH = face_ray_mask_path
-            print(f"Using face-ray-masked FaceMask ({len(face_mask_indices)} included faces, "
-                  f"{len(face_mask_excluded)} excluded) instead of the static facescape_mask.txt for this wrap.")
-        elif include_skin and use_face_ray_masking:
-            # Neither an already-computed neutral-frame face_ray_mask.json
-            # nor a prior wrap of THIS frame to rasterize against -- most
-            # likely the neutral frame has only had its bootstrap (--no-skin)
-            # wrap so far and its own skin-augmented pass hasn't run yet.
-            # Silently falling through to wrap_script_module's default
-            # (static facescape_mask.txt) would be easy to miss, so flag it
-            # loudly instead of just letting FACE_MASK_PATH stay unset.
-            print(
-                f"WARNING: {capture_id}/{frame_id}: no neutral-frame face_ray_mask.json at "
-                f"{ava256_output_root / capture_id / neutral['frame_id'] / 'face_ray_mask.json'} and no prior wrap of "
-                f"this frame to rasterize against -- falling back to the static facescape_mask.txt for this wrap. "
-                f"Run the neutral frame's skin-augmented wrap first (run_pipeline.py on {capture_id} with no --frame "
-                f"override) to get a proper face-ray-masked wrap here instead."
-            )
+            print(f"Using face_ray_mask {face_ray_mask_path_override} for {capture_id}/{frame_id}'s wrap.")
 
         # 3) Wrap.
         wrap_mesh(
@@ -551,7 +478,7 @@ def run_pipeline(
             pot_template_path=str(extended_pot_path),
         )
 
-        if include_skin:
+        if include_skin and mark_unconfirmed:
             tracker = Ava256LabelTracker(label_tracker_path)
             result = tracker.mark_unconfirmed(capture_id)
             if result is None:
@@ -621,6 +548,8 @@ def main() -> int:
                          help="Re-wrap even if this frame/phase already succeeded (skips the label_tracker.json / "
                               "wrapped_mesh.obj-existence idempotency check)")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--no-mark-unconfirmed", action="store_true",
+                        help="Don't move the capture to 'unconfirmed' after a skin wrap (run_pipeline_batch.py marks it after all frames)")
     args = parser.parse_args()
 
     output_path = run_pipeline(
@@ -655,6 +584,7 @@ def main() -> int:
         face_ray_mask_path_override=Path(args.face_ray_mask_path) if args.face_ray_mask_path else None,
         dry_run=args.dry_run,
         force=args.force,
+        mark_unconfirmed=not args.no_mark_unconfirmed,
     )
     print(f"Wrapped mesh at {output_path}")
     return 0

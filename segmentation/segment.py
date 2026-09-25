@@ -98,7 +98,7 @@ class FaceSegmentation:
 
     def __init__(self, checkpoint_path=None):
         checkpoint_path = checkpoint_path or "/scratch/ondemand32/irwinngo/models/sam_vit_h_4b8939.pth"
-        device = "cuda"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         model_type = "default"
         self.sam = sam_model_registry[model_type](checkpoint=checkpoint_path)
         self.sam.to(device=device)

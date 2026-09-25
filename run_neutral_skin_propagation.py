@@ -295,6 +295,82 @@ def write_frame_outputs(
 
 # --- main propagation ----------------------------------------------------------
 
+def ensure_capture_face_mask(capture_id: str, *, force: bool = False, dry_run: bool = False, **wrap_kwargs) -> bool:
+    """The capture's face mask, computed once here so run_pipeline.py (the
+    wrap side) never needs a GPU:
+      1. wrap the neutral frame again WITH its skin landmarks (static
+         facescape_mask.txt, no label change) for a tighter fit, then
+      2. run face ray masking (SAM/U2Net + pytorch3d, GPU) on that wrap and
+         write <out>/<capture>/<neutral>/face_ray_mask.json (excluded faces,
+         what Wrap's FaceMask node reads) + face_ray_mask_included.json.
+    Skips when the mask already exists, unless force. wrap_kwargs are
+    run_pipeline()'s keyword arguments (roots, template/checkpoint paths)."""
+    import neutral_frame as neutral_frame_module
+    import face_ray_masking_ava256
+
+    ava256_data_root = Path(wrap_kwargs["ava256_data_root"])
+    ava256_output_root = Path(wrap_kwargs["ava256_output_root"])
+    ava256_landmark_root = Path(wrap_kwargs["ava256_landmark_root"])
+    actor_dir = mesh_utils.resolve_capture_dir(ava256_data_root, capture_id)
+    neutral_frame_id = neutral_frame_module.resolve_neutral_frame(capture_id, actor_dir, ava256_landmark_root)["frame_id"]
+    output_dir = ava256_output_root / capture_id / neutral_frame_id
+    mask_path = output_dir / "face_ray_mask.json"
+
+    if mask_path.exists() and not force:
+        print(f"NOTE: {capture_id} already has a face mask ({mask_path}) -- skipping (use --force to recompute)")
+        return True
+    if dry_run:
+        print(f"[dry-run] {capture_id}: would re-wrap neutral {neutral_frame_id} with its skin landmarks, "
+              f"then run face ray masking -> {mask_path}")
+        return True
+
+    # 1) Second neutral wrap: skin landmarks on, static mask, label untouched.
+    print(f"{capture_id}: mask step 1/2 -- re-wrapping neutral {neutral_frame_id} with its skin landmarks")
+    wrap_pipeline(capture_id, **wrap_kwargs, include_skin=True, use_face_ray_masking=False,
+                  mark_unconfirmed=False, force=True)
+    wrapped_mesh_path = output_dir / "wrapped_mesh.obj"
+
+    # 2) Face ray masking on that wrap, in real-world scale.
+    print(f"{capture_id}: mask step 2/2 -- face ray masking on {wrapped_mesh_path}")
+    face_ray_masking_ava256.WRAP_SCRIPT_DIR = Path(wrap_kwargs["wrap_script_dir"])
+    face_ray_masking_ava256.FACESCAPE_MASK_PATH = Path(wrap_kwargs["facescape_mask_path"])
+    face_ray_masking_ava256.SAM_CHECKPOINT_PATH = Path(wrap_kwargs["sam_checkpoint_path"]) if wrap_kwargs.get("sam_checkpoint_path") else None
+    face_ray_masking_ava256.U2NET_CHECKPOINT_PATH = Path(wrap_kwargs["u2net_checkpoint_path"]) if wrap_kwargs.get("u2net_checkpoint_path") else None
+
+    mesh = trimesh.load(str(wrapped_mesh_path), process=False)
+    transform_params = dynamic_transform.load_params(dynamic_transform.params_path(ava256_output_root, capture_id))
+    verts_world = dynamic_transform.untransform(np.asarray(mesh.vertices, dtype=np.float64), transform_params)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    _wrap_mesh_fn, default_neutral_mesh_path, _wrap_script_module = _load_wrap_script(Path(wrap_kwargs["wrap_script_path"]))
+    extended_pot_path = mesh_utils.build_live_extended_pot(Path(wrap_kwargs["template_pot_path"]), default_neutral_mesh_path)
+    with Path(extended_pot_path).open("r", encoding="utf-8") as f:
+        pot_rows_by_index = dict(enumerate(json.load(f)))
+    camera_ids = camera_utils.load_all_camera_ids(actor_dir)
+    camera_params = {cid: camera_utils.load_camera(actor_dir, cid) for cid in camera_ids}
+
+    front_cams, right_cams, left_cams = face_ray_masking_ava256.classify_front_right_left(
+        verts_world, faces, pot_rows_by_index, camera_ids, camera_params,
+    )
+    included = face_ray_masking_ava256.compute_face_ray_mask(
+        verts_world, faces, actor_dir, neutral_frame_id, camera_ids, camera_params,
+        front_cams, right_cams, left_cams, pot_rows_by_index=pot_rows_by_index,
+    )
+    # Free SAM/U2Net before anything else wants the GPU.
+    face_ray_masking_ava256._bg_segmenter = None
+    face_ray_masking_ava256._face_segmenter = None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Wrap's FaceMask (SelectPolygons) node reads the EXCLUDED set.
+    excluded = sorted(set(range(faces.shape[0])) - set(included))
+    for name, data in (("face_ray_mask.json", excluded), ("face_ray_mask_included.json", sorted(included))):
+        tmp_path = output_dir / f"{name}.tmp"
+        tmp_path.write_text(json.dumps(data), encoding="utf-8")
+        tmp_path.replace(output_dir / name)
+    print(f"DONE {capture_id}: face mask {mask_path} ({len(included)} included, {len(excluded)} excluded faces)")
+    return True
+
+
 def process_capture(
     capture_id: str,
     *,
@@ -324,7 +400,24 @@ def process_capture(
     cotracker_checkpoint_path: Path = DEFAULTS["cotracker_checkpoint_path"],
     dry_run: bool = False,
     force: bool = False,
+    mask_only: bool = False,
 ) -> None:
+    wrap_kwargs = dict(
+        ava256_data_root=ava256_data_root, ava256_landmark_root=ava256_landmark_root,
+        ava256_output_root=ava256_output_root, label_tracker_path=label_tracker_path,
+        ava256_mesh_topology_path=ava256_mesh_topology_path, wrap_script_path=wrap_script_path,
+        template_pot_path=template_pot_path, template_wrap_path=template_wrap_path,
+        faceform_wrap_cmd_path=faceform_wrap_cmd_path, faceform_wrap_license_path=faceform_wrap_license_path,
+        sam_checkpoint_path=sam_checkpoint_path, u2net_checkpoint_path=u2net_checkpoint_path,
+        wrap_script_dir=wrap_script_dir, facescape_mask_path=facescape_mask_path,
+        blendshape_root=blendshape_root, facescape_run_pipeline_path=facescape_run_pipeline_path,
+    )
+    if mask_only:
+        # Only the second neutral wrap + face mask (e.g. captures propagated
+        # before masking moved here) -- no label change, no propagation.
+        ensure_capture_face_mask(capture_id, force=force, dry_run=dry_run, **wrap_kwargs)
+        return
+
     ensure_label_tracker_file(label_tracker_path)
     ava256_landmark_root.mkdir(parents=True, exist_ok=True)
     ava256_output_root.mkdir(parents=True, exist_ok=True)
@@ -565,6 +658,13 @@ def process_capture(
                 ava256_landmark_root, capture_id, frame_id, neutral_frame_id, seg_id, points_by_group, dry_run
             )
 
+        # The neutral frame's skin landmarks exist now: re-wrap it with them
+        # and compute the capture's face mask (GPU). Free the trackers first.
+        del cotracker_model, raft_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        ensure_capture_face_mask(capture_id, force=force, dry_run=dry_run, **wrap_kwargs)
+
         tracker = Ava256LabelTracker(label_tracker_path)
         result = tracker.confirm_labeled(capture_id)
         if result is None:
@@ -615,6 +715,9 @@ def main() -> int:
                          help="Re-propagate even if this capture's label_tracker.json status is already past "
                               "'unlabeled' (normally skipped for free; use this to force a genuine re-propagate)")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--mask-only", action="store_true",
+                        help="Only re-wrap the neutral frame with its skin landmarks and compute the capture's face "
+                             "mask (for captures already propagated); no propagation, no label change")
     args = parser.parse_args()
 
     process_capture(
@@ -645,6 +748,7 @@ def main() -> int:
         max_frames_per_segment=args.max_frames_per_segment,
         dry_run=args.dry_run,
         force=args.force,
+        mask_only=args.mask_only,
     )
     return 0
 
