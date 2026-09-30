@@ -154,6 +154,106 @@ def _capture_pipeline_lock(output_root: Path, capture_id: str):
         lock_file.close()
 
 
+# The kinematic_tracking scan is upside down relative to the FLAME template
+# (best-fit landmark rotation ~168 deg on AAN112), so after the dynamic
+# transform the scan and every target point are rotated 180 deg about X; the
+# wrap is rotated back before wrapped_mesh.obj is saved, so that file stays in
+# the plain (unrotated) template frame every consumer expects.
+FLIP_X = np.diag([1.0, -1.0, -1.0])
+ORIENTATION_WARN_DEG = 45.0
+# Neutral frame's scan face mask (kinematic_tracking face indices, same topology
+# every frame), written by run_neutral_skin_propagation.ensure_capture_face_mask.
+SCAN_FACE_MASK_NAME = "scan_face_mask_included.json"
+NUM_STANDARD_ROWS = 74
+# After the flip, the scan and targets are also translated so the chin
+# landmark's target (standard index 50) sits exactly on the FLAME neutral's
+# chin landmark -- the dynamic transform only matches bbox centres, which left
+# the jaw/neck misaligned (squeezed neck on AAN112). Undone before saving.
+CHIN_ROW = 50
+
+
+def _filter_by_scan_mask(target_points, missing_indices, verts_world, faces, scan_mask: set[int], transform_params) -> list[int]:
+    """Skin rows (>= 74) whose target point lands (nearest face) on a scan face
+    outside the scan's SAM face mask -- e.g. hair where the ears should be.
+    target_points are in the (unrotated) template frame."""
+    rows = [i for i in range(NUM_STANDARD_ROWS, len(target_points)) if i not in missing_indices]
+    if not rows:
+        return []
+    pts = np.array([[target_points[i]["x"], target_points[i]["y"], target_points[i]["z"]] for i in rows], dtype=np.float64)
+    pts_world = dynamic_transform.untransform(pts, transform_params)
+    scan = trimesh.Trimesh(vertices=verts_world, faces=faces, process=False)
+    _closest, _dist, face_ids = trimesh.proximity.closest_point(scan, pts_world)
+    return [i for i, f in zip(rows, face_ids) if int(f) not in scan_mask]
+
+
+def _rotate_targets(target_points, missing_indices) -> list[dict[str, float]]:
+    out = []
+    for i, p in enumerate(target_points):
+        if i in missing_indices:
+            out.append(dict(p))
+            continue
+        x, y, z = FLIP_X @ np.array([p["x"], p["y"], p["z"]], dtype=np.float64)
+        out.append({"x": float(x), "y": float(y), "z": float(z)})
+    return out
+
+
+def _orientation_angle_deg(target_points, missing_indices, pot_rows, neutral_mesh_path: Path) -> float | None:
+    """Best-fit rotation (Kabsch) between the template's standard landmarks on
+    neutral.obj and the (rotated) targets -- ~0 when the rotation put the scan
+    the right way up."""
+    rows = [i for i in range(min(NUM_STANDARD_ROWS, len(pot_rows))) if i not in missing_indices]
+    if len(rows) < 4:
+        return None
+    mesh = trimesh.load(str(neutral_mesh_path), process=False)
+    V, F = np.asarray(mesh.vertices), np.asarray(mesh.faces)
+    a = np.array([mesh_utils.pot_row_world_xyz(V, F, pot_rows[i]) for i in rows])
+    b = np.array([[target_points[i]["x"], target_points[i]["y"], target_points[i]["z"]] for i in rows])
+    a, b = a - a.mean(0), b - b.mean(0)
+    U, _S, Wt = np.linalg.svd(a.T @ b)
+    d = np.sign(np.linalg.det(Wt.T @ U.T))
+    R = Wt.T @ np.diag([1.0, 1.0, d]) @ U.T
+    return float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
+
+
+def _chin_offset(target_points, missing_indices, pot_rows, neutral_mesh_path: Path) -> np.ndarray:
+    """Translation that puts the (flipped) chin target on neutral.obj's chin
+    landmark; zero if this frame has no chin target."""
+    if CHIN_ROW in missing_indices or CHIN_ROW >= len(target_points):
+        return np.zeros(3)
+    mesh = trimesh.load(str(neutral_mesh_path), process=False)
+    chin_neutral = mesh_utils.pot_row_world_xyz(np.asarray(mesh.vertices), np.asarray(mesh.faces), pot_rows[CHIN_ROW])
+    t = target_points[CHIN_ROW]
+    return np.asarray(chin_neutral, dtype=np.float64) - np.array([t["x"], t["y"], t["z"]], dtype=np.float64)
+
+
+def _translate_targets(target_points, missing_indices, offset: np.ndarray) -> list[dict[str, float]]:
+    out = []
+    for i, p in enumerate(target_points):
+        if i in missing_indices:
+            out.append(dict(p))
+            continue
+        out.append({"x": p["x"] + float(offset[0]), "y": p["y"] + float(offset[1]), "z": p["z"] + float(offset[2])})
+    return out
+
+
+def _unrotate_wrapped_obj(path: Path, offset: np.ndarray | None = None) -> None:
+    """Take the saved wrap back out of the aligned frame: undo the chin
+    translation, then the flip (FLIP_X is its own inverse). Rewrites only its
+    'v' lines."""
+    offset = np.zeros(3) if offset is None else np.asarray(offset, dtype=np.float64)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    out = []
+    for line in lines:
+        if line.startswith("v "):
+            x, y, z = FLIP_X @ (np.array([float(t) for t in line.split()[1:4]]) - offset)
+            out.append(f"v {x:.6f} {y:.6f} {z:.6f}")
+        else:
+            out.append(line)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
 def _load_template_pot(template_pot_path: Path) -> list[list[float]]:
     with Path(template_pot_path).open("r", encoding="utf-8") as f:
         return json.load(f)
@@ -407,9 +507,7 @@ def run_pipeline(
                 f"({neutral['frame_id']}) first so its scan bbox can seed the capture-level transform."
             )
         verts_transformed = dynamic_transform.transform(verts_world, transform_params)
-        scan_obj_path = output_dir / "scan.obj"
-        if not dry_run:
-            mesh_utils.write_obj(scan_obj_path, verts_transformed, faces)
+        scan_obj_path = output_dir / "scan.obj"  # written below, once the chin offset is known
 
         # 2) Target correspondence. template_pot_path is the base 74-row
         # file; live-extend it with today's actual skin vertex set (see
@@ -442,6 +540,45 @@ def run_pipeline(
             target_points, missing_indices = _build_propagated_target_correspondence(
                 actor_dir, ava256_landmark_root, capture_id, frame_id, pot_rows, transform_params,
             )
+        # 2.2) Scan-mask landmark filter (skin-augmented wraps with a capture
+        # face mask): drop skin rows whose target lands on a scan face outside
+        # the neutral frame's scan face mask.
+        if include_skin and use_face_ray_masking:
+            scan_mask_path = ava256_output_root / capture_id / neutral["frame_id"] / SCAN_FACE_MASK_NAME
+            if not scan_mask_path.exists():
+                raise RuntimeError(
+                    f"no scan face mask for {capture_id} ({scan_mask_path}) -- run "
+                    f"run_neutral_skin_propagation.py --mask-only for this capture first"
+                )
+            scan_mask = set(json.loads(scan_mask_path.read_text(encoding="utf-8")))
+            off_face = _filter_by_scan_mask(target_points, set(missing_indices), verts_world, faces, scan_mask, transform_params)
+            if off_face:
+                print(f"NOTE: {len(off_face)} skin correspondence point(s) land outside the scan face mask "
+                      f"({scan_mask_path.name}) -- excluded from the correspondence map: {off_face}")
+            missing_indices = sorted(set(missing_indices) | set(off_face))
+
+        # 2.3) Same 180 deg X rotation as the scan, then an orientation check.
+        target_points = _rotate_targets(target_points, set(missing_indices))
+        angle = _orientation_angle_deg(target_points, set(missing_indices), pot_rows, default_neutral_mesh_path)
+        if angle is not None:
+            print(f"Orientation check {capture_id}/{frame_id}: template-to-target landmark rotation {angle:.1f} deg after the X flip")
+            if angle > ORIENTATION_WARN_DEG:
+                print(f"WARNING: {capture_id}/{frame_id}: landmarks still {angle:.1f} deg from the template after the "
+                      f"180 deg X flip -- this capture's scan may not be upside down; check this wrap")
+
+        # 2.4) Chin alignment: translate the (flipped) scan and targets so the
+        # chin target sits on the neutral's chin landmark.
+        chin_offset = _chin_offset(target_points, set(missing_indices), pot_rows, default_neutral_mesh_path)
+        if np.any(chin_offset):
+            target_points = _translate_targets(target_points, set(missing_indices), chin_offset)
+            print(f"Chin alignment {capture_id}/{frame_id}: translated scan + targets by "
+                  f"{np.round(chin_offset, 5).tolist()} (template units, |d|={np.linalg.norm(chin_offset):.4f})")
+        else:
+            print(f"NOTE: {capture_id}/{frame_id}: no chin target (row {CHIN_ROW}) -- chin alignment skipped")
+        if not dry_run:
+            # Flipped 180 deg about X and chin-aligned -- the wrap is taken back below.
+            mesh_utils.write_obj(scan_obj_path, verts_transformed @ FLIP_X.T + chin_offset, faces)
+
         correspondence_path = output_dir / "target_correspondence.json"
         if not dry_run:
             with correspondence_path.open("w", encoding="utf-8") as f:
@@ -477,6 +614,8 @@ def run_pipeline(
             neutral_mesh_path=str(default_neutral_mesh_path),
             pot_template_path=str(extended_pot_path),
         )
+        # Back to the plain template frame (undo the chin offset, then the flip).
+        _unrotate_wrapped_obj(wrapped_mesh_path, chin_offset)
 
         if include_skin and mark_unconfirmed:
             tracker = Ava256LabelTracker(label_tracker_path)

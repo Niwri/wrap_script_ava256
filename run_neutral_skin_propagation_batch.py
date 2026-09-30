@@ -4,8 +4,16 @@ run_pipeline_batch.py's mechanics, gated on "unlabeled" status (the implicit
 default for any capture with no label_tracker entry yet) instead of
 "unreviewed".
 
+--mask-only runs only each capture's face-mask step (run_neutral_skin_propagation.py
+--mask-only: the SAM wrap mask + scan face mask on its neutral frame) instead of
+propagation. Without --captures it picks every capture with a wrapped neutral
+frame whose masks are missing or older than the current mask code
+(run_neutral_skin_propagation.face_masks_current), whatever its label status;
+--force recomputes them for every such capture.
+
 Usage:
     python3 run_neutral_skin_propagation_batch.py [--captures ID ...] [--parallel N] [--gpu-ids 0 1 ...] [--dry-run]
+    python3 run_neutral_skin_propagation_batch.py --mask-only [--captures ID ...] [--parallel N] [--gpu-ids 0 1 ...]
 """
 from __future__ import annotations
 
@@ -23,7 +31,7 @@ PROPAGATION_SCRIPT = SCRIPT_DIR / "run_neutral_skin_propagation.py"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from label_tracker_ava256 import Ava256LabelTracker, ensure_label_tracker_file
-from run_neutral_skin_propagation import DEFAULTS
+from run_neutral_skin_propagation import DEFAULTS, face_masks_current
 
 POLL_INTERVAL_SECONDS = 60
 
@@ -42,6 +50,34 @@ def discover_unlabeled_captures(ava256_data_root: Path, label_tracker_path: Path
         c for c in captures
         if tracker.get_status(c, all_statuses=all_statuses) == "unlabeled"
     ]
+
+
+def discover_mask_captures(ava256_data_root: Path, ava256_landmark_root: Path, ava256_output_root: Path,
+                           force: bool) -> list[str]:
+    """--mask-only sweep: captures with raw data and a wrapped neutral frame
+    (neutral_frame.json -> output/<capture>/<neutral>/wrapped_mesh.obj) whose
+    face masks aren't current -- or every such capture with force."""
+    import json
+
+    selected, current = [], 0
+    for capture_dir in sorted(p for p in Path(ava256_output_root).iterdir() if p.is_dir() and "--" in p.name):
+        capture_id = capture_dir.name
+        neutral_json = Path(ava256_landmark_root) / capture_id / "neutral_frame.json"
+        if not (Path(ava256_data_root) / capture_id).is_dir() or not neutral_json.exists():
+            continue
+        try:
+            neutral_frame_id = json.loads(neutral_json.read_text())["frame_id"]
+        except (OSError, ValueError, KeyError):
+            continue
+        neutral_dir = capture_dir / neutral_frame_id
+        if not (neutral_dir / "wrapped_mesh.obj").exists():
+            continue
+        if not force and face_masks_current(neutral_dir):
+            current += 1
+            continue
+        selected.append(capture_id)
+    print(f"--mask-only: {len(selected)} capture(s) need masks ({current} already current)")
+    return selected
 
 
 def process_capture(capture_id: str, extra_flags: list[str], log_dir: Path | None, gpu_id: str | None, dry_run: bool) -> CaptureResult:
@@ -73,6 +109,9 @@ def process_capture(capture_id: str, extra_flags: list[str], log_dir: Path | Non
 def run_sweep(args, extra_flags: list[str]) -> tuple[int, int]:
     if args.captures:
         captures = args.captures
+    elif args.mask_only:
+        captures = discover_mask_captures(Path(args.ava256_data_root), Path(args.ava256_landmark_root),
+                                          Path(args.ava256_output_root), args.force)
     else:
         captures = discover_unlabeled_captures(Path(args.ava256_data_root), Path(args.label_tracker_path))
 
@@ -128,6 +167,9 @@ def main() -> int:
     parser.add_argument("--force", action="store_true",
                          help="Forward run_neutral_skin_propagation.py's --force to every capture -- re-propagate "
                               "even if label_tracker.json already shows it done")
+    parser.add_argument("--mask-only", action="store_true",
+                        help="Only (re)compute each capture's face masks (run_neutral_skin_propagation.py --mask-only); "
+                             "without --captures, sweeps every capture with a wrapped neutral whose masks aren't current")
     parser.add_argument("--parallel", type=int, default=1)
     parser.add_argument("--gpu-ids", nargs="+", default=None)
     parser.add_argument("--log-dir", default=None)
@@ -165,6 +207,8 @@ def main() -> int:
     ]
     if args.force:
         extra_flags.append("--force")
+    if args.mask_only:
+        extra_flags.append("--mask-only")
 
     total_passed = total_failed = 0
     while True:

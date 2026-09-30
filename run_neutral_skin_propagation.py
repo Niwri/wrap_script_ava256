@@ -32,6 +32,7 @@ import fcntl
 import importlib.util
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -295,18 +296,38 @@ def write_frame_outputs(
 
 # --- main propagation ----------------------------------------------------------
 
+# Face masks written before this time (epoch seconds, 2026-09-30 01:30) were made
+# by older code (forced ear/nose regions, no scan mask, or every camera voting
+# with a fixed >= 8 votes threshold instead of the front cameras' strict
+# majority) and are regenerated.
+MASK_CODE_CUTOFF = 1790746217
+MASK_FILES = ("face_ray_mask.json", "face_ray_mask_included.json", "scan_face_mask_included.json")
+
+
+def face_masks_current(output_dir: Path) -> bool:
+    """All three mask files exist and none predates MASK_CODE_CUTOFF."""
+    return all((output_dir / name).exists() and (output_dir / name).stat().st_mtime >= MASK_CODE_CUTOFF
+               for name in MASK_FILES)
+
+
 def ensure_capture_face_mask(capture_id: str, *, force: bool = False, dry_run: bool = False, **wrap_kwargs) -> bool:
     """The capture's face mask, computed once here so run_pipeline.py (the
     wrap side) never needs a GPU:
       1. wrap the neutral frame again WITH its skin landmarks (static
          facescape_mask.txt, no label change) for a tighter fit, then
-      2. run face ray masking (SAM/U2Net + pytorch3d, GPU) on that wrap and
-         write <out>/<capture>/<neutral>/face_ray_mask.json (excluded faces,
-         what Wrap's FaceMask node reads) + face_ray_mask_included.json.
-    Skips when the mask already exists, unless force. wrap_kwargs are
-    run_pipeline()'s keyword arguments (roots, template/checkpoint paths)."""
+      2. run SAM once per camera (nosebridge prompt) and, from those masks,
+         vote faces on that wrap -> <out>/<capture>/<neutral>/face_ray_mask.json
+         (excluded faces, what Wrap's FaceMask node reads) +
+         face_ray_mask_included.json, and on the neutral frame's scan
+         (kinematic_tracking) -> scan_face_mask_included.json, which
+         run_pipeline.py uses to drop skin landmarks landing off the face.
+    Skips when all mask files exist and are newer than MASK_CODE_CUTOFF,
+    unless force; older masks (made by the previous code) are regenerated.
+    wrap_kwargs are run_pipeline()'s keyword arguments (roots,
+    template/checkpoint paths)."""
     import neutral_frame as neutral_frame_module
     import face_ray_masking_ava256
+    import face_ray_masking_ava256_mesh
 
     ava256_data_root = Path(wrap_kwargs["ava256_data_root"])
     ava256_output_root = Path(wrap_kwargs["ava256_output_root"])
@@ -316,9 +337,11 @@ def ensure_capture_face_mask(capture_id: str, *, force: bool = False, dry_run: b
     output_dir = ava256_output_root / capture_id / neutral_frame_id
     mask_path = output_dir / "face_ray_mask.json"
 
-    if mask_path.exists() and not force:
-        print(f"NOTE: {capture_id} already has a face mask ({mask_path}) -- skipping (use --force to recompute)")
+    if face_masks_current(output_dir) and not force:
+        print(f"NOTE: {capture_id} already has current face masks ({output_dir}) -- skipping (use --force to recompute)")
         return True
+    if mask_path.exists():
+        print(f"{capture_id}: face masks missing or older than the current mask code -- regenerating")
     if dry_run:
         print(f"[dry-run] {capture_id}: would re-wrap neutral {neutral_frame_id} with its skin landmarks, "
               f"then run face ray masking -> {mask_path}")
@@ -351,10 +374,24 @@ def ensure_capture_face_mask(capture_id: str, *, force: bool = False, dry_run: b
     front_cams, right_cams, left_cams = face_ray_masking_ava256.classify_front_right_left(
         verts_world, faces, pot_rows_by_index, camera_ids, camera_params,
     )
+    # One SAM pass (nosebridge prompt, standard index 57 on this wrap) on the
+    # FRONT cameras only -- the only ones that vote -- shared by the wrap mask
+    # and the scan mask.
+    front_ids = [c for c in camera_ids if c in front_cams]
+    print(f"{capture_id}: {len(front_ids)} front camera(s) vote: {front_ids}")
+    nosebridge_xyz = mesh_utils.pot_row_world_xyz(verts_world, faces, pot_rows_by_index[57])
+    sam_masks = face_ray_masking_ava256_mesh.compute_sam_masks(
+        actor_dir, neutral_frame_id, front_ids, camera_params, nosebridge_xyz,
+    )
     included = face_ray_masking_ava256.compute_face_ray_mask(
         verts_world, faces, actor_dir, neutral_frame_id, camera_ids, camera_params,
         front_cams, right_cams, left_cams, pot_rows_by_index=pot_rows_by_index,
+        precomputed_masks=sam_masks,
     )
+    scan_verts_world, scan_faces = mesh_utils.build_world_mesh(
+        actor_dir, neutral_frame_id, Path(wrap_kwargs["ava256_mesh_topology_path"]),
+    )
+    scan_included = face_ray_masking_ava256_mesh.vote_faces(scan_verts_world, scan_faces, sam_masks, camera_params)
     # Free SAM/U2Net before anything else wants the GPU.
     face_ray_masking_ava256._bg_segmenter = None
     face_ray_masking_ava256._face_segmenter = None
@@ -363,11 +400,17 @@ def ensure_capture_face_mask(capture_id: str, *, force: bool = False, dry_run: b
 
     # Wrap's FaceMask (SelectPolygons) node reads the EXCLUDED set.
     excluded = sorted(set(range(faces.shape[0])) - set(included))
-    for name, data in (("face_ray_mask.json", excluded), ("face_ray_mask_included.json", sorted(included))):
+    meta = {"written": time.strftime("%Y-%m-%d %H:%M:%S"), "mask_code_cutoff": MASK_CODE_CUTOFF,
+            "neutral_frame": neutral_frame_id, "cameras": sorted(sam_masks),
+            "vote_rule": f"front cameras, > {face_ray_masking_ava256.AGREEMENT_FRACTION:.0%} of those seeing a face",
+            "wrap_faces_included": len(included), "scan_faces_included": len(scan_included), "scan_faces_total": int(scan_faces.shape[0])}
+    for name, data in (("face_ray_mask.json", excluded), ("face_ray_mask_included.json", sorted(included)),
+                       ("scan_face_mask_included.json", scan_included), ("face_masks_meta.json", meta)):
         tmp_path = output_dir / f"{name}.tmp"
         tmp_path.write_text(json.dumps(data), encoding="utf-8")
         tmp_path.replace(output_dir / name)
-    print(f"DONE {capture_id}: face mask {mask_path} ({len(included)} included, {len(excluded)} excluded faces)")
+    print(f"DONE {capture_id}: face mask {mask_path} ({len(included)} included, {len(excluded)} excluded faces); "
+          f"scan face mask {len(scan_included)}/{scan_faces.shape[0]} scan faces")
     return True
 
 

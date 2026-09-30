@@ -19,6 +19,11 @@ frame is cheap enough as-is.
 Usage:
     python3 run_pipeline_batch.py [--captures ID ...] [--parallel N] [--gpu-ids 0 1 ...]
         [--segments SEG_ID ...] [--max-frames-per-segment N] [--neutral-only] [--dry-run]
+    python3 run_pipeline_batch.py --rerun-only [--frame-label-path DIR] [--captures ID ...] [--dry-run]
+
+--rerun-only re-wraps (forced) only the frames labeled "Rerun" in each
+capture's FaceView label CSV (--frame-label-path/<capture>.csv, FRAME_ID,STATUS);
+without --captures it sweeps every capture whose CSV has Rerun frames.
 """
 from __future__ import annotations
 
@@ -70,7 +75,15 @@ DEFAULTS = {
     # Ava-256's own equivalent of Nersemble's LINE_RENDERS_ROOT convention --
     # see render_wrapped_landmarks.py's render_keyline_video().
     "line_renders_root": Path("/scratch/ondemand32/irwinngo/line_renders_ava256"),
+    # point_overlay.py's post-capture landmark point-overlay video
+    # (<capture>_<camera>.mp4) -- same default as point_overlay.DEFAULT_OUTPUT_ROOT.
+    "point_overlay_root": Path("/scratch/ondemand32/irwinngo/point_overlay_renders_ava256"),
+    # FaceView's Ava-256 tab archives each capture's reviewed frame labels here
+    # on Done: <capture>.csv with FRAME_ID,STATUS (Valid / Invalid / Rerun).
+    "frame_label_path": Path("/scratch/ondemand32/irwinngo/ava256-labels"),
 }
+
+RERUN_STATUS = "Rerun"
 
 POLL_INTERVAL_SECONDS = 60
 
@@ -94,6 +107,22 @@ def discover_unreviewed_captures(ava256_data_root: Path, label_tracker_path: Pat
         c for c in captures
         if tracker.get_status(c, all_statuses=all_statuses) == "unreviewed"
     ]
+
+
+def read_rerun_frames(frame_label_path: Path, capture_id: str) -> list[str] | None:
+    """Zero-padded frame ids labeled "Rerun" in <frame_label_path>/<capture>.csv
+    (FRAME_ID,STATUS), in file order; None when the capture has no label CSV."""
+    path = Path(frame_label_path) / f"{capture_id}.csv"
+    if not path.exists():
+        return None
+    with path.open("r", encoding="utf-8", newline="") as f:
+        return [row["FRAME_ID"].strip().zfill(6) for row in csv.DictReader(f)
+                if row.get("STATUS", "").strip() == RERUN_STATUS]
+
+
+def discover_rerun_captures(frame_label_path: Path) -> list[str]:
+    """--rerun-only sweep: every capture whose label CSV has a "Rerun" frame."""
+    return sorted(p.stem for p in Path(frame_label_path).glob("*.csv") if read_rerun_frames(frame_label_path, p.stem))
 
 
 def read_segments(actor_dir: Path) -> dict[str, list[str]]:
@@ -180,6 +209,9 @@ def process_capture(
               "run run_neutral_skin_propagation.py (or its --mask-only) first")
         return CaptureResult(capture_id, passed=False, skipped=True)
 
+    if args.rerun_only:
+        return rerun_capture_frames(capture_id, neutral_frame_id, root_flags, log_dir, gpu_id, dry_run, args)
+
     neutral_ok = _run_pipeline_once(capture_id, None, root_flags, log_dir, gpu_id, dry_run)
     if not neutral_ok:
         return CaptureResult(capture_id, passed=False)
@@ -217,6 +249,51 @@ def process_capture(
             print(f"NOTE: not moving {capture_id} to 'unconfirmed' -- current status is {tracker.get_status(capture_id)!r}")
         else:
             print(f"[capture={capture_id}] marked 'unconfirmed'")
+    return result
+
+
+def rerun_capture_frames(
+    capture_id: str, neutral_frame_id: str, root_flags: list[str], log_dir: Path | None,
+    gpu_id: str | None, dry_run: bool, args,
+) -> CaptureResult:
+    """--rerun-only: re-wraps (forced) just the frames labeled "Rerun" in the
+    capture's --frame-label-path CSV -- the neutral frame first if it is one of
+    them, otherwise its existing wrap is left as is. Frames without landmark
+    data are skipped (not failed). The capture's label_tracker.json status is
+    not touched: its frames were already reviewed in FaceView."""
+    rerun = read_rerun_frames(Path(args.frame_label_path), capture_id)
+    if rerun is None:
+        print(f"SKIP [capture={capture_id}]: no label CSV at {Path(args.frame_label_path) / (capture_id + '.csv')}")
+        return CaptureResult(capture_id, passed=False, skipped=True)
+    if not rerun:
+        print(f"SKIP [capture={capture_id}]: no frames labeled {RERUN_STATUS!r}")
+        return CaptureResult(capture_id, passed=False, skipped=True)
+    print(f"[capture={capture_id}] {len(rerun)} frame(s) labeled {RERUN_STATUS!r}")
+
+    result = CaptureResult(capture_id, passed=True)
+    if neutral_frame_id in rerun:
+        result.frames_total += 1
+        if not _run_pipeline_once(capture_id, None, root_flags, log_dir, gpu_id, dry_run):
+            result.frames_failed += 1
+            return CaptureResult(capture_id, passed=False, frames_total=1, frames_failed=1)
+        result.frames_wrapped += 1
+
+    capture_landmark_dir = Path(args.ava256_landmark_root) / capture_id
+    for frame_id in rerun:
+        if frame_id == neutral_frame_id:
+            continue
+        result.frames_total += 1
+        if not next(capture_landmark_dir.glob(f"*_{frame_id}.json"), None):
+            result.frames_skipped_no_landmarks += 1
+            continue
+        if _run_pipeline_once(capture_id, frame_id, root_flags, log_dir, gpu_id, dry_run):
+            result.frames_wrapped += 1
+        else:
+            result.frames_failed += 1
+    print(
+        f"[capture={capture_id}] Rerun frames: total={result.frames_total} wrapped={result.frames_wrapped} "
+        f"failed={result.frames_failed} skipped_no_landmarks={result.frames_skipped_no_landmarks}"
+    )
     return result
 
 
@@ -276,7 +353,7 @@ def render_capture_point_overlay_video(capture_id: str, args) -> None:
     """Post-capture step next to render_capture_keyline_video(): one
     landmark point-overlay video (annotated vs. wrapped-mesh landmarks, see
     point_overlay.py) across every wrapped frame of the capture, written to
-    point_overlay.DEFAULT_OUTPUT_ROOT on the capture's most frontal camera."""
+    --point-overlay-root on the capture's most frontal camera."""
     import mesh_utils
     import neutral_frame as neutral_frame_module
     import point_overlay
@@ -293,12 +370,15 @@ def render_capture_point_overlay_video(capture_id: str, args) -> None:
     frame_ids = render_wrapped_landmarks.list_wrapped_frames_in_capture_order(
         actor_dir, roots["ava256_output_root"], capture_id, neutral_frame_id=neutral["frame_id"],
     )
-    point_overlay.render_point_overlay_video(capture_id, frame_ids, camera_id, **roots)
+    point_overlay.render_point_overlay_video(capture_id, frame_ids, camera_id, **roots,
+                                             output_root=Path(args.point_overlay_root))
 
 
 def run_sweep(args, root_flags: list[str]) -> tuple[int, int, int, int, int]:
     if args.captures:
         captures = args.captures
+    elif args.rerun_only:
+        captures = discover_rerun_captures(Path(args.frame_label_path))
     else:
         captures = discover_unreviewed_captures(Path(args.ava256_data_root), Path(args.label_tracker_path))
 
@@ -364,6 +444,8 @@ def main() -> int:
                               "already shows it done (normally skipped for free; use this to force a genuine re-wrap)")
     parser.add_argument("--line-renders-root", default=str(DEFAULTS["line_renders_root"]),
                          help="Output directory for the per-capture keyline video (Ava-256's own LINE_RENDERS_ROOT)")
+    parser.add_argument("--point-overlay-root", default=str(DEFAULTS["point_overlay_root"]),
+                         help="Output directory for the per-capture landmark point-overlay video (point_overlay.py)")
     parser.add_argument("--no-video", action="store_true",
                          help="Skip the automatic post-capture keyline video render (batch wrapping only)")
     parser.add_argument("--parallel", type=int, default=1)
@@ -378,8 +460,16 @@ def main() -> int:
     parser.add_argument("--neutral-only", action="store_true",
                          help="Wrap only each capture's neutral frame, skipping the frame_list.csv sweep "
                               "(restores this script's old, pre-frame-loop behavior)")
+    parser.add_argument("--rerun-only", action="store_true",
+                         help="Re-wrap (forced) only the frames labeled 'Rerun' in each capture's --frame-label-path "
+                              "CSV; without --captures, sweeps every capture with a label CSV that has Rerun frames")
+    parser.add_argument("--frame-label-path", default=str(DEFAULTS["frame_label_path"]),
+                         help="Directory of FaceView's archived Ava-256 frame labels (<capture>.csv: FRAME_ID,STATUS), "
+                              "read by --rerun-only")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.rerun_only and not Path(args.frame_label_path).is_dir():
+        parser.error(f"--rerun-only needs --frame-label-path to be a directory: {args.frame_label_path}")
 
     ensure_label_tracker_file(Path(args.label_tracker_path))
     Path(args.ava256_landmark_root).mkdir(parents=True, exist_ok=True)
@@ -405,7 +495,7 @@ def main() -> int:
     ]
     if args.no_face_ray_masking:
         root_flags.append("--no-face-ray-masking")
-    if args.force:
+    if args.force or args.rerun_only:  # Rerun frames are already wrapped
         root_flags.append("--force")
     # This script marks each capture 'unconfirmed' itself, after its frames.
     root_flags.append("--no-mark-unconfirmed")

@@ -83,7 +83,13 @@ FACESCAPE_MASK_PATH = SCRIPT_DIR / "facescape_mask.txt"
 SAM_CHECKPOINT_PATH: Path | None = None  # None -> segment.FaceSegmentation's own hardcoded default
 U2NET_CHECKPOINT_PATH: Path | None = None  # None -> segment.BackgroundSegmentation's own hardcoded default
 MASK_EROSION_ITERATIONS = 1
-MIN_WEIGHT = 8.0
+MIN_WEIGHT = 8.0  # old rule (every camera, >= 8 votes); no longer used by the vote
+# Vote rule: only FRONT cameras (classify_front_right_left) vote, and a face is
+# kept when a strict majority (> AGREEMENT_FRACTION) of the front cameras that
+# see it (rasterized, unoccluded) have it inside their SAM mask. Near-frontal
+# side cameras whose SAM masks spill onto the hair used to outvote the rest
+# under the fixed >= 8 votes rule (CPA784: 216 hair faces in the scan mask).
+AGREEMENT_FRACTION = 0.5
 from camera_classify import FRONT_ANGLE_THRESHOLD_DEG, classify_front_right_left  # noqa: E402,F401 (re-export)
 # Per-face normal-vs-camera angle threshold for compute_face_ray_mask()'s own
 # hit-rejection filter (see below) -- deliberately its own constant, NOT
@@ -248,6 +254,7 @@ def compute_face_ray_mask(
     left_cameras: set[str],
     pot_rows_by_index: dict[int, list[float]] | None = None,
     save_weights_path: Path | None = None,
+    precomputed_masks: dict[str, np.ndarray] | None = None,
 ) -> list[int]:
     """Returns the final face-index list (already intersected with
     facescape_mask.txt and eroded) to use as the skin-augmented wrap's
@@ -256,9 +263,12 @@ def compute_face_ray_mask(
     JSON right after the camera vote loop -- lets a caller inspect/re-
     threshold the continuous signal without a second full SAM/U2Net run
     (see render_face_ray_mask_heatmap.py for the same data via a different,
-    return-instead-of-continue code path). If pot_rows_by_index is given,
-    the ear/nose landmark regions are forcefully unioned back in after
-    erosion -- see _force_include_region_faces(). Also, if given, its
+    return-instead-of-continue code path). precomputed_masks, if given,
+    replaces the per-camera SAM step (camera_id -> full-resolution 0/1 mask).
+    The ear/nose regions are no
+    longer force-included after erosion (on scans with hair over the ears
+    that put the ears on the hair); _force_include_region_faces() is kept
+    but unused. If pot_rows_by_index is given, its
     nosebridge landmark
     (index 57 -- above where even a full beard/mustache reaches) is
     reprojected into each camera and used as that camera's SAM point-prompt
@@ -294,41 +304,58 @@ def compute_face_ray_mask(
     img_hw: dict[str, tuple[int, int]] = {}
     valid_cam_ids: list[str] = []
 
-    for cam_id in camera_ids:
-        try:
-            image = camera_utils.load_image(actor_dir, cam_id, frame_id)  # BGR, matches the original's own cv2-sourced convention
-        except (KeyError, FileNotFoundError):
-            continue
-        orig_h, orig_w = image.shape[:2]
-        seg_h, seg_w = max(1, orig_h // 2), max(1, orig_w // 2)
-        seg_input = cv2.resize(image, (seg_w, seg_h), interpolation=cv2.INTER_AREA)
+    # Only the front cameras vote (see AGREEMENT_FRACTION).
+    camera_ids = [c for c in camera_ids if c in front_cameras]
+    if not camera_ids:
+        raise RuntimeError(f"No front cameras for face-ray-masking (capture={actor_dir.name}, frame={frame_id})")
 
-        point_hints: list[tuple[int, int]] = []
-        if prompt_anchor_xyzs:
-            K_cam, Rt_cam = camera_params[cam_id]
-            for anchor_xyz in prompt_anchor_xyzs.values():
-                px, py = camera_utils.project_points(anchor_xyz[None, :], K_cam, Rt_cam)[0]
-                # project_points() is in ORIGINAL image scale -- seg_input is
-                # half-resolution, so scale down to match.
-                hint_x, hint_y = int(round(px * seg_w / orig_w)), int(round(py * seg_h / orig_h))
-                if 0 <= hint_x < seg_w and 0 <= hint_y < seg_h:
-                    point_hints.append((hint_x, hint_y))
-                # else: this anchor projects outside this camera's frame
-                # (occluded/facing away) -- just skip it, keep whichever
-                # other anchor(s) are still in-frame.
+    if precomputed_masks is not None:
+        # Full-resolution per-camera SAM masks computed once by the caller
+        # (face_ray_masking_ava256_mesh.compute_sam_masks), e.g. shared with the
+        # scan-face mask -- no second SAM pass.
+        for cam_id in camera_ids:
+            mask = precomputed_masks.get(cam_id)
+            if mask is None:
+                continue
+            masks[cam_id] = mask
+            img_hw[cam_id] = mask.shape[:2]
+            valid_cam_ids.append(cam_id)
+    else:
+        for cam_id in camera_ids:
+            try:
+                image = camera_utils.load_image(actor_dir, cam_id, frame_id)  # BGR, matches the original's own cv2-sourced convention
+            except (KeyError, FileNotFoundError):
+                continue
+            orig_h, orig_w = image.shape[:2]
+            seg_h, seg_w = max(1, orig_h // 2), max(1, orig_w // 2)
+            seg_input = cv2.resize(image, (seg_w, seg_h), interpolation=cv2.INTER_AREA)
 
-        mask = _get_face_mask(seg_input, point_hints=point_hints).astype(np.uint8)
-        num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        if num_labels > 1:
-            largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-            mask = (labels == largest_label).astype(np.uint8)
-        if mask.shape != (orig_h, orig_w):
-            mask = cv2.resize(mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
-            mask = (mask > 0).astype(np.uint8)
+            point_hints: list[tuple[int, int]] = []
+            if prompt_anchor_xyzs:
+                K_cam, Rt_cam = camera_params[cam_id]
+                for anchor_xyz in prompt_anchor_xyzs.values():
+                    px, py = camera_utils.project_points(anchor_xyz[None, :], K_cam, Rt_cam)[0]
+                    # project_points() is in ORIGINAL image scale -- seg_input is
+                    # half-resolution, so scale down to match.
+                    hint_x, hint_y = int(round(px * seg_w / orig_w)), int(round(py * seg_h / orig_h))
+                    if 0 <= hint_x < seg_w and 0 <= hint_y < seg_h:
+                        point_hints.append((hint_x, hint_y))
+                    # else: this anchor projects outside this camera's frame
+                    # (occluded/facing away) -- just skip it, keep whichever
+                    # other anchor(s) are still in-frame.
 
-        masks[cam_id] = mask
-        img_hw[cam_id] = (orig_h, orig_w)
-        valid_cam_ids.append(cam_id)
+            mask = _get_face_mask(seg_input, point_hints=point_hints).astype(np.uint8)
+            num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+            if num_labels > 1:
+                largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+                mask = (labels == largest_label).astype(np.uint8)
+            if mask.shape != (orig_h, orig_w):
+                mask = cv2.resize(mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+                mask = (mask > 0).astype(np.uint8)
+
+            masks[cam_id] = mask
+            img_hw[cam_id] = (orig_h, orig_w)
+            valid_cam_ids.append(cam_id)
 
     if not valid_cam_ids:
         raise RuntimeError(f"No usable camera images for face-ray-masking (capture={actor_dir.name}, frame={frame_id})")
@@ -396,19 +423,20 @@ def compute_face_ray_mask(
     intersector = camera_selection.build_ray_intersector(wrapped_mesh_verts, wrapped_mesh_faces)
     face_angle_threshold_rad = math.radians(FACE_ANGLE_THRESHOLD_DEG)
 
+    # Per face: how many front cameras see it (rasterized anywhere, passing the
+    # angle + occlusion checks) and how many of those have it inside their SAM mask.
+    face_seen: dict[int, int] = {}
     for i, cam_id in enumerate(valid_cam_ids):
         mask = masks[cam_id]
-        face_idx_map = fragments.pix_to_face[i, ..., 0].cpu().numpy()
-        hit_face_idx = face_idx_map[mask > 0]
-        hit_face_idx = hit_face_idx[hit_face_idx >= 0]
-        hit_face_idx = hit_face_idx - face_offsets[i]
-        hit_face_idx = hit_face_idx[(hit_face_idx >= 0) & (hit_face_idx < num_faces)]
+        face_idx_map = fragments.pix_to_face[i, ..., 0].cpu().numpy() - face_offsets[i]
+        in_range = (face_idx_map >= 0) & (face_idx_map < num_faces)
+        inside = set(np.unique(face_idx_map[in_range & (mask > 0)]).tolist())
         cam_weight = camera_weights.get(cam_id, 1.0)
 
         _K_cam, Rt_cam = camera_params[cam_id]
         camera_center = camera_utils.camera_center_world(Rt_cam)
         angle_rejected = occlusion_rejected = 0
-        for face_idx in np.unique(hit_face_idx):
+        for face_idx in np.unique(face_idx_map[in_range]):
             face_idx = int(face_idx)
             normal = face_normals[face_idx]
             if camera_selection.score_camera_for_landmark(normal, Rt_cam) > face_angle_threshold_rad:
@@ -417,18 +445,21 @@ def compute_face_ray_mask(
             if camera_selection.is_occluded(intersector, face_centers[face_idx], normal, camera_center):
                 occlusion_rejected += 1
                 continue
-            face_to_weight[face_idx] = face_to_weight.get(face_idx, 0.0) + cam_weight
+            face_seen[face_idx] = face_seen.get(face_idx, 0) + 1
+            if face_idx in inside:
+                face_to_weight[face_idx] = face_to_weight.get(face_idx, 0.0) + cam_weight
         print(f"  face_ray_masking cam={cam_id} weight={cam_weight} cumulative_faces_hit={len(face_to_weight)} "
               f"(angle_rejected={angle_rejected} occlusion_rejected={occlusion_rejected})")
 
     if save_weights_path is not None:
         Path(save_weights_path).write_text(
-            json.dumps({str(k): v for k, v in face_to_weight.items()}), encoding="utf-8"
+            json.dumps({str(k): [face_to_weight.get(k, 0.0), n] for k, n in face_seen.items()}), encoding="utf-8"
         )
-        print(f"Saved raw per-face weights ({len(face_to_weight)} faces) -> {save_weights_path}")
+        print(f"Saved raw per-face [votes, cameras seeing it] ({len(face_seen)} faces) -> {save_weights_path}")
 
-    hit_faces = {face_idx for face_idx, weight in face_to_weight.items() if weight >= MIN_WEIGHT}
-    print(f"Faces with cumulative weight >= {MIN_WEIGHT}: {len(hit_faces)} out of {num_faces}")
+    hit_faces = {f for f, n in face_seen.items() if face_to_weight.get(f, 0.0) / n > AGREEMENT_FRACTION}
+    print(f"Faces inside the SAM mask of > {AGREEMENT_FRACTION:.0%} of the {len(valid_cam_ids)} front camera(s) "
+          f"that see them: {len(hit_faces)} out of {num_faces}")
 
     reference_hit_faces = _reference_hit_faces(num_faces)
     hit_faces = hit_faces & reference_hit_faces
@@ -436,12 +467,5 @@ def compute_face_ray_mask(
 
     hit_faces = erode_hit_faces(wrapped_mesh_faces, hit_faces, iterations=MASK_EROSION_ITERATIONS)
     print(f"Faces after eroding mask boundary ({MASK_EROSION_ITERATIONS} iteration(s)): {len(hit_faces)}")
-
-    if pot_rows_by_index is not None:
-        ear_faces = _force_include_region_faces(wrapped_mesh_faces, pot_rows_by_index, EAR_STANDARD_INDICES, EAR_NOSE_FORCE_INCLUDE_HOPS)
-        nose_faces = _force_include_region_faces(wrapped_mesh_faces, pot_rows_by_index, NOSE_STANDARD_INDICES, EAR_NOSE_FORCE_INCLUDE_HOPS)
-        forced = (ear_faces | nose_faces) - hit_faces
-        hit_faces |= forced
-        print(f"Faces after forcefully including ear/nose regions: {len(hit_faces)} (+{len(forced)} forced)")
 
     return sorted(hit_faces)

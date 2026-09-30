@@ -23,6 +23,7 @@
 #       [extra run_pipeline_batch.py flags, e.g. --no-video --no-face-ray-masking --log-dir /path --poll --dry-run]
 #   ./run_wrapping_batch.sh                          # sweep every capture at 'unreviewed', one at a time
 #   ./run_wrapping_batch.sh --captures A B C --parallel 3 --gpu-ids 0 1 2
+#   ./run_wrapping_batch.sh --rerun-only [--captures A B]   # re-wrap only frames labeled "Rerun" in FRAME_LABEL_PATH/<capture>.csv
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,6 +57,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # --- Automatic keyline-video output (batch-only feature) ---------------------
 : "${LINE_RENDERS_ROOT:=/scratch/ondemand32/irwinngo/line_renders_ava256}"
+# Landmark point-overlay video (point_overlay.py), rendered next to the keyline video.
+: "${POINT_OVERLAY_ROOT:=/scratch/ondemand32/irwinngo/point_overlay_renders_ava256}"
+
+# --- FaceView frame labels (read by --rerun-only) ------------------------------
+# <capture>.csv with FRAME_ID,STATUS (Valid / Invalid / Rerun), archived by
+# FaceView's Ava-256 tab on Done.
+: "${FRAME_LABEL_PATH:=/scratch/ondemand32/irwinngo/ava256-labels}"
 
 # --- Parallelism ---------------------------------------------------------------
 # Leave PARALLEL=1/GPU_IDS unset to run one capture at a time on the default
@@ -88,6 +96,8 @@ exec "${PYTHON_BIN}" "${SCRIPT_DIR}/run_pipeline_batch.py" \
     --blendshape-root "${BLENDSHAPE_ROOT}" \
     --facescape-run-pipeline-path "${FACESCAPE_RUN_PIPELINE_PATH}" \
     --line-renders-root "${LINE_RENDERS_ROOT}" \
+    --point-overlay-root "${POINT_OVERLAY_ROOT}" \
+    --frame-label-path "${FRAME_LABEL_PATH}" \
     --parallel "${PARALLEL}" \
     "${GPU_IDS_ARGS[@]}" \
     "$@"

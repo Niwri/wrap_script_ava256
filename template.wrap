@@ -138,7 +138,7 @@
      ]
     },
     "controlPointsWeight": {
-     "value": 100
+     "value": 10.0
     },
     "displayGeomInd": {
      "value": -2
@@ -184,7 +184,7 @@
      "value": 1.5
     },
     "smoothness": {
-     "value": 0.5
+     "value": 20.0
     },
     "tolerance": {
      "value": 0.00100000005
@@ -1933,7 +1933,7 @@
      ]
     },
     "source": {
-     "value": 0
+     "value": 1
     }
    }
   },
@@ -2091,10 +2091,10 @@
      "connectedNodeId": 51
     },
     "globalControlPointsWeightFinal": {
-     "value": 1
+     "value": 10.0
     },
     "globalControlPointsWeightInitial": {
-     "value": 10
+     "value": 100.0
     },
     "globalPoint2PlaneFittingWeight": {
      "value": 1

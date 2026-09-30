@@ -66,6 +66,12 @@ class Ava256LabelTracker:
             finally:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
 
+    def set_status(self, capture_id: str, status: AvaLabelStatus) -> None:
+        """Unconditional write (no from-status check) -- for steps that own the
+        capture's status outright, e.g. render_capture_line_video.py marking a
+        freshly rendered capture "unconfirmed" for review in FaceView."""
+        self._write(capture_id, status)
+
     def confirm_labeled(self, capture_id: str) -> AvaLabelStatus | None:
         """unlabeled -> unreviewed. Called directly by
         run_neutral_skin_propagation.py on full success -- there is no prior
