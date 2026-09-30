@@ -86,10 +86,19 @@ MASK_EROSION_ITERATIONS = 1
 MIN_WEIGHT = 8.0  # old rule (every camera, >= 8 votes); no longer used by the vote
 # Vote rule: only FRONT cameras (classify_front_right_left) vote, and a face is
 # kept when a strict majority (> AGREEMENT_FRACTION) of the front cameras that
-# see it (rasterized, unoccluded) have it inside their SAM mask. Near-frontal
-# side cameras whose SAM masks spill onto the hair used to outvote the rest
-# under the fixed >= 8 votes rule (CPA784: 216 hair faces in the scan mask).
+# see it (rasterized, unoccluded) have it inside their SAM mask, OR when at
+# least MIN_AGREEING_CAMERAS of them do. Near-frontal side cameras whose SAM
+# masks spill onto the hair used to outvote the rest under the fixed >= 8
+# votes rule (CPA784: 216 hair faces in the scan mask).
 AGREEMENT_FRACTION = 0.5
+MIN_AGREEING_CAMERAS = 3
+
+
+def passes_vote(votes: float, n_seen: int, agreement: float = AGREEMENT_FRACTION,
+                min_votes: int = MIN_AGREEING_CAMERAS) -> bool:
+    return votes / n_seen > agreement or votes >= min_votes
+
+
 from camera_classify import FRONT_ANGLE_THRESHOLD_DEG, classify_front_right_left  # noqa: E402,F401 (re-export)
 # Per-face normal-vs-camera angle threshold for compute_face_ray_mask()'s own
 # hit-rejection filter (see below) -- deliberately its own constant, NOT
@@ -457,9 +466,9 @@ def compute_face_ray_mask(
         )
         print(f"Saved raw per-face [votes, cameras seeing it] ({len(face_seen)} faces) -> {save_weights_path}")
 
-    hit_faces = {f for f, n in face_seen.items() if face_to_weight.get(f, 0.0) / n > AGREEMENT_FRACTION}
-    print(f"Faces inside the SAM mask of > {AGREEMENT_FRACTION:.0%} of the {len(valid_cam_ids)} front camera(s) "
-          f"that see them: {len(hit_faces)} out of {num_faces}")
+    hit_faces = {f for f, n in face_seen.items() if passes_vote(face_to_weight.get(f, 0.0), n)}
+    print(f"Faces inside the SAM mask of > {AGREEMENT_FRACTION:.0%} (or >= {MIN_AGREEING_CAMERAS}) of the "
+          f"{len(valid_cam_ids)} front camera(s) that see them: {len(hit_faces)} out of {num_faces}")
 
     reference_hit_faces = _reference_hit_faces(num_faces)
     hit_faces = hit_faces & reference_hit_faces

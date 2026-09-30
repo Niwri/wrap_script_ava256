@@ -296,11 +296,11 @@ def write_frame_outputs(
 
 # --- main propagation ----------------------------------------------------------
 
-# Face masks written before this time (epoch seconds, 2026-09-30 01:30) were made
-# by older code (forced ear/nose regions, no scan mask, or every camera voting
-# with a fixed >= 8 votes threshold instead of the front cameras' strict
-# majority) and are regenerated.
-MASK_CODE_CUTOFF = 1790746217
+# Face masks written before this time (epoch seconds, 2026-09-30 05:12) were made
+# by older code (forced ear/nose regions, no scan mask, every camera voting
+# with a fixed >= 8 votes threshold, or the front cameras' strict majority
+# without the >= 3 agreeing cameras alternative) and are regenerated.
+MASK_CODE_CUTOFF = 1790759566
 MASK_FILES = ("face_ray_mask.json", "face_ray_mask_included.json", "scan_face_mask_included.json")
 
 
@@ -402,7 +402,8 @@ def ensure_capture_face_mask(capture_id: str, *, force: bool = False, dry_run: b
     excluded = sorted(set(range(faces.shape[0])) - set(included))
     meta = {"written": time.strftime("%Y-%m-%d %H:%M:%S"), "mask_code_cutoff": MASK_CODE_CUTOFF,
             "neutral_frame": neutral_frame_id, "cameras": sorted(sam_masks),
-            "vote_rule": f"front cameras, > {face_ray_masking_ava256.AGREEMENT_FRACTION:.0%} of those seeing a face",
+            "vote_rule": f"front cameras, > {face_ray_masking_ava256.AGREEMENT_FRACTION:.0%} or >= "
+                         f"{face_ray_masking_ava256.MIN_AGREEING_CAMERAS} of those seeing a face",
             "wrap_faces_included": len(included), "scan_faces_included": len(scan_included), "scan_faces_total": int(scan_faces.shape[0])}
     for name, data in (("face_ray_mask.json", excluded), ("face_ray_mask_included.json", sorted(included)),
                        ("scan_face_mask_included.json", scan_included), ("face_masks_meta.json", meta)):

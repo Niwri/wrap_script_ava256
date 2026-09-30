@@ -14,7 +14,8 @@ Same segmentation and voting as face_ray_masking_ava256:
     the caller passes only the FRONT cameras); for each face, counts the
     cameras that see it (not occluded) and those whose SAM mask covers it;
     faces covered for a strict majority (> AGREEMENT_FRACTION, 50%) of the
-    cameras seeing them are kept, then the boundary is eroded
+    cameras seeing them, or by at least MIN_AGREEING_CAMERAS (3) of them, are
+    kept, then the boundary is eroded
     MASK_EROSION_ITERATIONS (1) time(s). Unlike
     the wrap mask there's no intersection with facescape_mask.txt -- that list
     is in FLAME template face indices and has no meaning on the scan's own
@@ -40,6 +41,7 @@ import camera_utils
 import face_ray_masking_ava256 as frm
 
 AGREEMENT_FRACTION = frm.AGREEMENT_FRACTION
+MIN_AGREEING_CAMERAS = frm.MIN_AGREEING_CAMERAS
 MASK_EROSION_ITERATIONS = frm.MASK_EROSION_ITERATIONS
 
 
@@ -86,12 +88,13 @@ def vote_faces(
     camera_params: dict[str, tuple[np.ndarray, np.ndarray]],
     *,
     agreement: float = AGREEMENT_FRACTION,
+    min_votes: int = MIN_AGREEING_CAMERAS,
     erosion_iterations: int = MASK_EROSION_ITERATIONS,
     weights_out: dict | None = None,
 ) -> list[int]:
     """Faces of (verts_world, faces) inside the SAM mask of a strict majority
-    (> agreement) of the cameras in `masks` that see them (angle + occlusion
-    checked), boundary eroded. The caller passes only the front cameras'
+    (> agreement), or of at least min_votes, of the cameras in `masks` that
+    see them (angle + occlusion checked), boundary eroded. The caller passes only the front cameras'
     masks. weights_out gets face -> (votes, cameras seeing it)."""
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     num_faces = faces.shape[0]
@@ -151,8 +154,8 @@ def vote_faces(
     if weights_out is not None:
         weights_out.update({f: (weight.get(f, 0.0), n) for f, n in seen.items()})
 
-    hit_faces = {f for f, n in seen.items() if weight.get(f, 0.0) / n > agreement}
-    print(f"faces inside the SAM mask of > {agreement:.0%} of the cameras that see them: "
+    hit_faces = {f for f, n in seen.items() if frm.passes_vote(weight.get(f, 0.0), n, agreement, min_votes)}
+    print(f"faces inside the SAM mask of > {agreement:.0%} (or >= {min_votes}) of the cameras that see them: "
           f"{len(hit_faces)} / {num_faces} ({len(cams)} cameras)")
     hit_faces = frm.erode_hit_faces(faces, hit_faces, iterations=erosion_iterations)
     print(f"after eroding the boundary ({erosion_iterations}x): {len(hit_faces)}")
@@ -169,6 +172,7 @@ def compute_scan_face_mask(
     nosebridge_xyz: np.ndarray,
     *,
     agreement: float = AGREEMENT_FRACTION,
+    min_votes: int = MIN_AGREEING_CAMERAS,
     erosion_iterations: int = MASK_EROSION_ITERATIONS,
     sam_masks_out: dict | None = None,
     weights_out: dict | None = None,
@@ -179,7 +183,8 @@ def compute_scan_face_mask(
     if sam_masks_out is not None:
         sam_masks_out.update(masks)
     return vote_faces(scan_verts_world, scan_faces, masks, camera_params,
-                      agreement=agreement, erosion_iterations=erosion_iterations, weights_out=weights_out)
+                      agreement=agreement, min_votes=min_votes, erosion_iterations=erosion_iterations,
+                      weights_out=weights_out)
 
 
 def submesh(verts: np.ndarray, faces: np.ndarray, keep_faces) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
