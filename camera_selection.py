@@ -54,12 +54,13 @@ def build_ray_intersector(verts_world: np.ndarray, faces: np.ndarray):
         return trimesh.ray.ray_triangle.RayMeshIntersector(mesh)
 
 
-def is_occluded(intersector, landmark_xyz: np.ndarray, face_normal: np.ndarray, camera_center: np.ndarray) -> bool:
+def is_occluded(intersector, landmark_xyz: np.ndarray, face_normal: np.ndarray, camera_center: np.ndarray,
+                normal_nudge: float = NORMAL_NUDGE) -> bool:
     """Ray from just off the landmark's own surface (nudged along its
     normal to dodge a false self-hit on its own triangle) toward the camera
     center. Any OTHER intersection strictly closer than the camera means
     something on this same mesh blocks the view."""
-    origin = landmark_xyz + NORMAL_NUDGE * face_normal
+    origin = landmark_xyz + normal_nudge * face_normal
     to_cam = camera_center - origin
     dist = float(np.linalg.norm(to_cam))
     if dist == 0.0:
@@ -71,7 +72,7 @@ def is_occluded(intersector, landmark_xyz: np.ndarray, face_normal: np.ndarray, 
     if len(locations) == 0:
         return False
     hit_dists = np.linalg.norm(locations - origin, axis=1)
-    return bool(np.any(hit_dists < dist - NORMAL_NUDGE))
+    return bool(np.any(hit_dists < dist - normal_nudge))
 
 
 def landmark_position_and_normal(
@@ -88,6 +89,7 @@ def rank_candidates_for_landmark(
     camera_ids: list[str],
     camera_params: dict[str, tuple[np.ndarray, np.ndarray]],
     intersector,
+    normal_nudge: float = NORMAL_NUDGE,
 ) -> list[tuple[str, float]]:
     """All unoccluded cameras for this landmark, sorted by ascending angle
     score (best first). Occluded cameras are excluded entirely (not scored
@@ -97,7 +99,7 @@ def rank_candidates_for_landmark(
     for cam_id in camera_ids:
         K, Rt = camera_params[cam_id]
         center = camera_utils.camera_center_world(Rt)
-        if is_occluded(intersector, xyz, normal, center):
+        if is_occluded(intersector, xyz, normal, center, normal_nudge):
             continue
         score = score_camera_for_landmark(normal, Rt)
         scored.append((cam_id, score))
@@ -115,10 +117,16 @@ def select_cameras_for_landmarks(
     *,
     min_cameras: int = DEFAULT_MIN_CAMERAS,
     angle_threshold_deg: float = DEFAULT_ANGLE_THRESHOLD_DEG,
+    normal_nudge: float | None = None,
 ) -> dict[int, list[str]]:
     """Full pipeline: score+occlusion-filter every (landmark, camera) pair,
     threshold, then two-stage greedy-cluster to bound total distinct
-    cameras touched. Returns landmark_index -> assigned camera ids."""
+    cameras touched. Returns landmark_index -> assigned camera ids.
+
+    normal_nudge: occlusion-ray offset in the mesh's own world units
+    (default NORMAL_NUDGE, tuned for Ava-256's mm-scale world); pass one
+    scaled to the mesh for other datasets (e.g. FaceScape raw scans).
+    """
     intersector = build_ray_intersector(verts_world, faces)
     angle_threshold = math.radians(angle_threshold_deg)
 
@@ -126,7 +134,8 @@ def select_cameras_for_landmarks(
     thresholded_pool: dict[int, list[tuple[str, float]]] = {}
     for idx in landmark_indices:
         xyz, normal = landmark_position_and_normal(verts_world, faces, pot_rows_by_index[idx])
-        ranked = rank_candidates_for_landmark(xyz, normal, camera_ids, camera_params, intersector)
+        ranked = rank_candidates_for_landmark(xyz, normal, camera_ids, camera_params, intersector,
+                                              NORMAL_NUDGE if normal_nudge is None else normal_nudge)
         full_ranked[idx] = ranked
         under_threshold = [pair for pair in ranked if pair[1] <= angle_threshold]
         if len(under_threshold) < min_cameras:

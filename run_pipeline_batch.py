@@ -18,7 +18,7 @@ frame is cheap enough as-is.
 
 Usage:
     python3 run_pipeline_batch.py [--captures ID ...] [--parallel N] [--gpu-ids 0 1 ...]
-        [--segments SEG_ID ...] [--max-frames-per-segment N] [--neutral-only] [--dry-run]
+        [--segments SEG_ID ...] [--frame-stride N] [--max-frames-per-segment N] [--neutral-only] [--dry-run]
     python3 run_pipeline_batch.py --rerun-only [--frame-label-path DIR] [--captures ID ...] [--dry-run]
 
 --rerun-only re-wraps (forced) only the frames labeled "Rerun" in each
@@ -223,6 +223,10 @@ def process_capture(
     segments = read_segments(actor_dir)
     if args.segments:
         segments = {seg: frames for seg, frames in segments.items() if seg in args.segments}
+    if args.frame_stride > 1:
+        # Every Nth listed frame of each segment (frame_list.csv order). Only the
+        # wrapping is strided -- propagation tracks every frame.
+        segments = {seg: frames[:: args.frame_stride] for seg, frames in segments.items()}
     if args.max_frames_per_segment:
         segments = {seg: frames[: args.max_frames_per_segment] for seg, frames in segments.items()}
     frame_ids = [fid for frames in segments.values() for fid in frames if fid != neutral_frame_id]
@@ -455,6 +459,9 @@ def main() -> int:
     parser.add_argument("--segments", nargs="+", default=None,
                          help="Restrict the post-neutral frame sweep to these seg_ids only (same convention as "
                               "run_neutral_skin_propagation.py's own --segments)")
+    parser.add_argument("--frame-stride", type=int, default=10,
+                        help="Wrap every Nth frame of each segment (frame_list.csv order; Ava-256 already lists "
+                             "every 4th capture frame). Default 10; 1 = every listed frame. The neutral frame is always wrapped.")
     parser.add_argument("--max-frames-per-segment", type=int, default=None,
                          help="Cap frames wrapped per segment in the post-neutral frame sweep (debug/testing)")
     parser.add_argument("--neutral-only", action="store_true",

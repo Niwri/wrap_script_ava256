@@ -21,7 +21,7 @@ default already satisfies that transition's guard).
 Usage:
     python3 run_neutral_skin_propagation.py <CAPTURE_ID> [--ava256-data-root ...]
         [--min-cameras-per-landmark 5] [--angle-threshold-deg 80.0]
-        [--segments SEG_ID ...] [--max-frames-per-segment N] [--dry-run]
+        [--segments SEG_ID ...] [--frame-stride N] [--max-frames-per-segment N] [--dry-run]
 """
 from __future__ import annotations
 
@@ -301,7 +301,8 @@ def write_frame_outputs(
 # with a fixed >= 8 votes threshold, or the front cameras' strict majority
 # without the >= 3 agreeing cameras alternative) and are regenerated.
 MASK_CODE_CUTOFF = 1790759566
-MASK_FILES = ("face_ray_mask.json", "face_ray_mask_included.json", "scan_face_mask_included.json")
+MASK_FILES = ("face_ray_mask.json", "face_ray_mask_included.json", "scan_face_mask_included.json",
+              "landmark_filter.json")
 
 
 def face_masks_current(output_dir: Path) -> bool:
@@ -319,8 +320,10 @@ def ensure_capture_face_mask(capture_id: str, *, force: bool = False, dry_run: b
          vote faces on that wrap -> <out>/<capture>/<neutral>/face_ray_mask.json
          (excluded faces, what Wrap's FaceMask node reads) +
          face_ray_mask_included.json, and on the neutral frame's scan
-         (kinematic_tracking) -> scan_face_mask_included.json, which
-         run_pipeline.py uses to drop skin landmarks landing off the face.
+         (kinematic_tracking) -> scan_face_mask_included.json, and the
+         SAM landmark filter (landmark_sam_filter.py, same rule as
+         Nersemble's) -> landmark_filter.json, whose dropped indices
+         run_pipeline.py leaves out of every frame's correspondence map.
     Skips when all mask files exist and are newer than MASK_CODE_CUTOFF,
     unless force; older masks (made by the previous code) are regenerated.
     wrap_kwargs are run_pipeline()'s keyword arguments (roots,
@@ -392,6 +395,26 @@ def ensure_capture_face_mask(capture_id: str, *, force: bool = False, dry_run: b
         actor_dir, neutral_frame_id, Path(wrap_kwargs["ava256_mesh_topology_path"]),
     )
     scan_included = face_ray_masking_ava256_mesh.vote_faces(scan_verts_world, scan_faces, sam_masks, camera_params)
+
+    # SAM landmark filter on this neutral frame (landmark_sam_filter.py), over
+    # every used landmark: standard ones at their keypoints_3d position when
+    # the neutral frame has it, otherwise -- and for skin rows -- at their
+    # position on this (skin-augmented) wrap, which is exactly where
+    # propagation seeds them (e.g. ears 1/4/14 have no keypoints_3d on most
+    # frames, but every expression frame uses their propagated positions).
+    import landmark_sam_filter
+    kp_by_id = mesh_utils.keypoints_3d_by_id(actor_dir, neutral_frame_id)
+    targets = {}
+    for i in landmark_map.used_landmark_indices(len(pot_rows_by_index)):
+        kp_id = landmark_map.STANDARD_INDEX_TO_KEYPOINT3D_ID.get(i) if i < landmark_map.NUM_STANDARD_LANDMARKS else None
+        if kp_id is not None and kp_id in kp_by_id:
+            targets[i] = np.asarray(kp_by_id[kp_id], dtype=np.float64)
+        else:
+            targets[i] = mesh_utils.pot_row_world_xyz(verts_world, faces, pot_rows_by_index[i])
+    landmark_filter = landmark_sam_filter.compute_landmark_filter(
+        targets, sam_masks, camera_params, scan_verts_world, scan_faces)
+    print(f"{capture_id}: landmark filter kept {len(landmark_filter['kept'])}, dropped "
+          f"{len(landmark_filter['dropped'])}: {landmark_filter['dropped']}")
     # Free SAM/U2Net before anything else wants the GPU.
     face_ray_masking_ava256._bg_segmenter = None
     face_ray_masking_ava256._face_segmenter = None
@@ -406,13 +429,148 @@ def ensure_capture_face_mask(capture_id: str, *, force: bool = False, dry_run: b
                          f"{face_ray_masking_ava256.MIN_AGREEING_CAMERAS} of those seeing a face",
             "wrap_faces_included": len(included), "scan_faces_included": len(scan_included), "scan_faces_total": int(scan_faces.shape[0])}
     for name, data in (("face_ray_mask.json", excluded), ("face_ray_mask_included.json", sorted(included)),
-                       ("scan_face_mask_included.json", scan_included), ("face_masks_meta.json", meta)):
+                       ("scan_face_mask_included.json", scan_included),
+                       (landmark_sam_filter.LANDMARK_FILTER_NAME, landmark_filter), ("face_masks_meta.json", meta)):
         tmp_path = output_dir / f"{name}.tmp"
         tmp_path.write_text(json.dumps(data), encoding="utf-8")
         tmp_path.replace(output_dir / name)
     print(f"DONE {capture_id}: face mask {mask_path} ({len(included)} included, {len(excluded)} excluded faces); "
           f"scan face mask {len(scan_included)}/{scan_faces.shape[0]} scan faces")
     return True
+
+
+def ensure_segment_masks(capture_id: str, *, segments_filter: list[str] | None = None, force: bool = False,
+                         dry_run: bool = False, **wrap_kwargs) -> dict[str, list[int]]:
+    """Per-expression face mask + SAM landmark filter, built the same way as
+    the neutral frame's (ensure_capture_face_mask), on each segment's FIRST
+    frame (the first listed frame with propagated landmarks, neutral frame
+    excluded; --segments restricts):
+      1. wrap that frame with its skin landmarks and the static
+         facescape_mask.txt (no landmark filter, no label change) -- the
+         bootstrap wrap the mask is voted on, like the neutral's second wrap;
+      2. classify its front/right/left cameras on that wrap and run ONE SAM
+         pass (nosebridge prompt) on the front cameras;
+      3. vote FLAME faces on that wrap (face_ray_masking_ava256.
+         compute_face_ray_mask) -> face_ray_mask_<seg_id>.json (excluded
+         faces, Wrap's FaceMask input) + face_ray_mask_<seg_id>_included.json;
+      4. from the same SAM masks, the landmark filter on that frame's targets
+         (run_pipeline._build_propagated_target_correspondence, incl. its
+         per-frame keypoints_3d gate) and its kinematic_tracking mesh ->
+         landmark_filter_<seg_id>.json.
+    All stored with the neutral frame's outputs; run_pipeline.py uses them for
+    every non-neutral frame of the segment. Existing segment outputs are kept
+    unless force. Needs the capture's neutral face masks first (the dynamic
+    transform + neutral wrap). Returns {seg_id: dropped landmark indices}."""
+    import face_ray_masking_ava256
+    import face_ray_masking_ava256_mesh
+    import landmark_sam_filter
+    import neutral_frame as neutral_frame_module
+    from run_pipeline import _build_propagated_target_correspondence
+
+    ava256_data_root = Path(wrap_kwargs["ava256_data_root"])
+    ava256_output_root = Path(wrap_kwargs["ava256_output_root"])
+    ava256_landmark_root = Path(wrap_kwargs["ava256_landmark_root"])
+    actor_dir = mesh_utils.resolve_capture_dir(ava256_data_root, capture_id)
+    neutral_frame_id = neutral_frame_module.resolve_neutral_frame(capture_id, actor_dir, ava256_landmark_root)["frame_id"]
+    output_dir = ava256_output_root / capture_id / neutral_frame_id
+
+    segments = read_segments(actor_dir)
+    if segments_filter:
+        segments = {seg: frames for seg, frames in segments.items() if seg in segments_filter}
+    capture_landmark_dir = ava256_landmark_root / capture_id
+    todo = {}
+    for seg_id, frames in segments.items():
+        outputs = (landmark_sam_filter.segment_filter_path(output_dir, seg_id),
+                   landmark_sam_filter.segment_face_mask_path(output_dir, seg_id))
+        if all(p.exists() for p in outputs) and not force:
+            continue
+        first = next((f for f in frames
+                      if f != neutral_frame_id and next(capture_landmark_dir.glob(f"*_{f}.json"), None)), None)
+        if first:
+            todo[seg_id] = first
+    if not todo:
+        print(f"NOTE: {capture_id}: per-segment face masks / landmark filters up to date (or no propagated frames)")
+        return {}
+    if dry_run:
+        print(f"[dry-run] {capture_id}: would build face masks + landmark filters for {len(todo)} segment(s) "
+              "on their first frame")
+        return {}
+
+    face_ray_masking_ava256.WRAP_SCRIPT_DIR = Path(wrap_kwargs["wrap_script_dir"])
+    face_ray_masking_ava256.FACESCAPE_MASK_PATH = Path(wrap_kwargs["facescape_mask_path"])
+    face_ray_masking_ava256.SAM_CHECKPOINT_PATH = Path(wrap_kwargs["sam_checkpoint_path"]) if wrap_kwargs.get("sam_checkpoint_path") else None
+    face_ray_masking_ava256.U2NET_CHECKPOINT_PATH = Path(wrap_kwargs["u2net_checkpoint_path"]) if wrap_kwargs.get("u2net_checkpoint_path") else None
+    camera_ids = camera_utils.load_all_camera_ids(actor_dir)
+    camera_params = {cid: camera_utils.load_camera(actor_dir, cid) for cid in camera_ids}
+    transform_params = dynamic_transform.load_params(dynamic_transform.params_path(ava256_output_root, capture_id))
+    _wrap_mesh_fn, default_neutral_mesh_path, _mod = _load_wrap_script(Path(wrap_kwargs["wrap_script_path"]))
+    extended_pot_path = mesh_utils.build_live_extended_pot(Path(wrap_kwargs["template_pot_path"]), default_neutral_mesh_path)
+    with Path(extended_pot_path).open("r", encoding="utf-8") as f:
+        pot_rows = json.load(f)
+    pot_rows_by_index = dict(enumerate(pot_rows))
+
+    def write_json(name: str, data) -> None:
+        tmp_path = output_dir / f"{name}.tmp"
+        tmp_path.write_text(json.dumps(data), encoding="utf-8")
+        tmp_path.replace(output_dir / name)
+
+    written: dict[str, list[int]] = {}
+    for seg_id, frame_id in todo.items():
+        tag = f"{capture_id}/{seg_id} (first frame {frame_id})"
+        # 1) Bootstrap wrap of the segment's first frame: skin on, static mask.
+        print(f"{tag}: wrapping with the static mask for its face mask")
+        wrap_pipeline(capture_id, **wrap_kwargs, frame_id_override=frame_id, include_skin=True,
+                      use_face_ray_masking=False, mark_unconfirmed=False, force=True)
+        wrapped_mesh_path = ava256_output_root / capture_id / frame_id / "wrapped_mesh.obj"
+        if not wrapped_mesh_path.exists():
+            print(f"FAIL {tag}: bootstrap wrap missing ({wrapped_mesh_path}) -- no face mask / filter")
+            continue
+        mesh = trimesh.load(str(wrapped_mesh_path), process=False)
+        verts_world = dynamic_transform.untransform(np.asarray(mesh.vertices, dtype=np.float64), transform_params)
+        faces = np.asarray(mesh.faces, dtype=np.int64)
+
+        # 2) Cameras + one SAM pass on the front cameras (nosebridge prompt).
+        front_cams, right_cams, left_cams = face_ray_masking_ava256.classify_front_right_left(
+            verts_world, faces, pot_rows_by_index, camera_ids, camera_params)
+        front_ids = [c for c in camera_ids if c in front_cams]
+        nosebridge_xyz = mesh_utils.pot_row_world_xyz(verts_world, faces, pot_rows_by_index[57])
+        try:
+            sam_masks = face_ray_masking_ava256_mesh.compute_sam_masks(
+                actor_dir, frame_id, front_ids, camera_params, nosebridge_xyz)
+        except RuntimeError as exc:
+            print(f"FAIL {tag}: {exc} -- no face mask / filter")
+            continue
+
+        # 3) FLAME face mask on that wrap.
+        included = face_ray_masking_ava256.compute_face_ray_mask(
+            verts_world, faces, actor_dir, frame_id, camera_ids, camera_params,
+            front_cams, right_cams, left_cams, pot_rows_by_index=pot_rows_by_index, precomputed_masks=sam_masks)
+        excluded = sorted(set(range(faces.shape[0])) - set(included))
+
+        # 4) Landmark filter on this frame's own targets, same SAM masks.
+        target_points, missing = _build_propagated_target_correspondence(
+            actor_dir, ava256_landmark_root, capture_id, frame_id, pot_rows, transform_params)
+        used = set(landmark_map.used_landmark_indices(len(pot_rows))) - set(missing)
+        idx = sorted(i for i in used if i < len(target_points))
+        world = dynamic_transform.untransform(
+            np.array([[target_points[i]["x"], target_points[i]["y"], target_points[i]["z"]] for i in idx]), transform_params)
+        scan_verts, scan_faces = mesh_utils.build_world_mesh(actor_dir, frame_id, Path(wrap_kwargs["ava256_mesh_topology_path"]))
+        payload = landmark_sam_filter.compute_landmark_filter(dict(zip(idx, world)), sam_masks, camera_params, scan_verts, scan_faces)
+        payload.update({"segment": seg_id, "frame_id": frame_id, "neutral_frame": neutral_frame_id})
+
+        mask_path = landmark_sam_filter.segment_face_mask_path(output_dir, seg_id)
+        write_json(mask_path.name, excluded)
+        write_json(mask_path.name.replace(".json", "_included.json"), sorted(included))
+        write_json(landmark_sam_filter.segment_filter_path(output_dir, seg_id).name, payload)
+        written[seg_id] = payload["dropped"]
+        print(f"{tag}: face mask {len(included)} included / {len(excluded)} excluded faces ({len(sam_masks)} front "
+              f"cameras); landmark filter kept {len(payload['kept'])}, dropped {len(payload['dropped'])}: {payload['dropped']}")
+
+    face_ray_masking_ava256._bg_segmenter = None
+    face_ray_masking_ava256._face_segmenter = None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return written
 
 
 def process_capture(
@@ -427,6 +585,7 @@ def process_capture(
     angle_threshold_deg: float,
     segments_filter: list[str] | None,
     max_frames_per_segment: int | None,
+    frame_stride: int = 10,
     wrap_script_path: Path = DEFAULTS["wrap_script_path"],
     template_pot_path: Path = DEFAULTS["template_pot_path"],
     template_wrap_path: Path = DEFAULTS["template_wrap_path"],
@@ -458,8 +617,12 @@ def process_capture(
     )
     if mask_only:
         # Only the second neutral wrap + face mask (e.g. captures propagated
-        # before masking moved here) -- no label change, no propagation.
-        ensure_capture_face_mask(capture_id, force=force, dry_run=dry_run, **wrap_kwargs)
+        # before masking moved here), then the per-segment face masks and
+        # landmark filters for segments already propagated -- no label change,
+        # no propagation.
+        if ensure_capture_face_mask(capture_id, force=force, dry_run=dry_run, **wrap_kwargs):
+            ensure_segment_masks(capture_id, segments_filter=segments_filter, force=force,
+                                            dry_run=dry_run, **wrap_kwargs)
         return
 
     ensure_label_tracker_file(label_tracker_path)
@@ -594,6 +757,12 @@ def process_capture(
 
         if segments_filter:
             segments = {seg: frames for seg, frames in segments.items() if seg in segments_filter}
+        if frame_stride > 1:
+            # Every frame_stride-th listed frame of each segment -- the same
+            # frames run_pipeline_batch.py wraps with its own --frame-stride --
+            # plus the neutral frame in its own segment (tracking starts there).
+            segments = {seg: [f for i, f in enumerate(frames) if i % frame_stride == 0 or f == neutral_frame_id]
+                        for seg, frames in segments.items()}
         if max_frames_per_segment:
             segments = {seg: frames[:max_frames_per_segment] for seg, frames in segments.items()}
 
@@ -708,6 +877,12 @@ def process_capture(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         ensure_capture_face_mask(capture_id, force=force, dry_run=dry_run, **wrap_kwargs)
+        # Per-expression face masks + landmark filters, from the landmarks just
+        # propagated -- before the capture becomes "unreviewed" (the wrap
+        # batch's pickup signal), since run_pipeline.py needs them for every
+        # non-neutral frame.
+        ensure_segment_masks(capture_id, segments_filter=segments_filter, force=True,
+                                        dry_run=dry_run, **wrap_kwargs)
 
         tracker = Ava256LabelTracker(label_tracker_path)
         result = tracker.confirm_labeled(capture_id)
@@ -754,6 +929,9 @@ def main() -> int:
     parser.add_argument("--min-cameras-per-landmark", type=int, default=5)
     parser.add_argument("--angle-threshold-deg", type=float, default=80.0)
     parser.add_argument("--segments", nargs="+", default=None, help="Debug: restrict propagation to these seg_ids only")
+    parser.add_argument("--frame-stride", type=int, default=10,
+                        help="Propagate to every Nth listed frame of each segment (default 10, matching "
+                             "run_pipeline_batch.py's --frame-stride; 1 = every frame). The neutral frame is always kept.")
     parser.add_argument("--max-frames-per-segment", type=int, default=None, help="Debug: cap frames processed per segment")
     parser.add_argument("--force", action="store_true",
                          help="Re-propagate even if this capture's label_tracker.json status is already past "
@@ -790,6 +968,7 @@ def main() -> int:
         angle_threshold_deg=args.angle_threshold_deg,
         segments_filter=args.segments,
         max_frames_per_segment=args.max_frames_per_segment,
+        frame_stride=args.frame_stride,
         dry_run=args.dry_run,
         force=args.force,
         mask_only=args.mask_only,

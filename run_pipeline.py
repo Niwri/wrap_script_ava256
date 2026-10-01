@@ -40,6 +40,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import landmark_map
+import landmark_sam_filter
 import mesh_utils
 import camera_utils
 import dynamic_transform
@@ -161,29 +162,12 @@ def _capture_pipeline_lock(output_root: Path, capture_id: str):
 # the plain (unrotated) template frame every consumer expects.
 FLIP_X = np.diag([1.0, -1.0, -1.0])
 ORIENTATION_WARN_DEG = 45.0
-# Neutral frame's scan face mask (kinematic_tracking face indices, same topology
-# every frame), written by run_neutral_skin_propagation.ensure_capture_face_mask.
-SCAN_FACE_MASK_NAME = "scan_face_mask_included.json"
 NUM_STANDARD_ROWS = 74
 # After the flip, the scan and targets are also translated so the chin
 # landmark's target (standard index 50) sits exactly on the FLAME neutral's
 # chin landmark -- the dynamic transform only matches bbox centres, which left
 # the jaw/neck misaligned (squeezed neck on AAN112). Undone before saving.
 CHIN_ROW = 50
-
-
-def _filter_by_scan_mask(target_points, missing_indices, verts_world, faces, scan_mask: set[int], transform_params) -> list[int]:
-    """Skin rows (>= 74) whose target point lands (nearest face) on a scan face
-    outside the scan's SAM face mask -- e.g. hair where the ears should be.
-    target_points are in the (unrotated) template frame."""
-    rows = [i for i in range(NUM_STANDARD_ROWS, len(target_points)) if i not in missing_indices]
-    if not rows:
-        return []
-    pts = np.array([[target_points[i]["x"], target_points[i]["y"], target_points[i]["z"]] for i in rows], dtype=np.float64)
-    pts_world = dynamic_transform.untransform(pts, transform_params)
-    scan = trimesh.Trimesh(vertices=verts_world, faces=faces, process=False)
-    _closest, _dist, face_ids = trimesh.proximity.closest_point(scan, pts_world)
-    return [i for i, f in zip(rows, face_ids) if int(f) not in scan_mask]
 
 
 def _rotate_targets(target_points, missing_indices) -> list[dict[str, float]]:
@@ -348,7 +332,11 @@ def _build_propagated_target_correspondence(
     data with only 1/30 eyelid_lip indices missing. Every other standard
     group (ear/nosebridge/undernose/eyebrow/chin) still comes from
     propagation, matching run_neutral_skin_propagation.py's own per-group
-    camera-selection/tracking work for those regions. All of it is
+    camera-selection/tracking work for those regions -- but every standard
+    row (0-73) is only used on frames whose keypoints_3d has its keypoint
+    (STANDARD_INDEX_TO_KEYPOINT3D_ID): keypoints_3d gates the standard
+    landmarks per frame, so e.g. a propagated ear point is dropped on a frame
+    where keypoints_3d has no ear. All of it is
     real-world-scale, so transform_params is applied unconditionally here,
     same as before."""
     propagated = _load_propagated_points(ava256_landmark_root, capture_id, frame_id)
@@ -360,12 +348,14 @@ def _build_propagated_target_correspondence(
         if idx in landmark_map.ALWAYS_EXCLUDED_INDICES:
             missing_indices.append(idx)
             continue
-        if idx in eyelid_lip_indices:
+        if idx < landmark_map.NUM_STANDARD_LANDMARKS:
+            # Per-frame keypoints_3d gate for every standard row.
             kp_id = landmark_map.STANDARD_INDEX_TO_KEYPOINT3D_ID.get(idx)
             if kp_id is None or kp_id not in kp_by_id:
                 missing_indices.append(idx)
                 continue
-            xyz = np.array(kp_by_id[kp_id], dtype=np.float64)
+        if idx in eyelid_lip_indices:
+            xyz = np.array(kp_by_id[landmark_map.STANDARD_INDEX_TO_KEYPOINT3D_ID[idx]], dtype=np.float64)
         elif idx in propagated:
             xyz = np.array(propagated[idx], dtype=np.float64)
         else:
@@ -435,19 +425,25 @@ def run_pipeline(
     frame_id = frame_id_override or neutral["frame_id"]
     is_neutral_frame = frame_id == neutral["frame_id"]
 
-    # Every skin-augmented wrap -- the neutral frame's own included -- uses the
-    # capture's neutral-frame face_ray_mask.json (computed once by
-    # run_neutral_skin_propagation.py): the visible face region is a property
-    # of the actor's face + camera rig, not of the expression. An explicit
-    # --face-ray-mask-path still wins.
-    if face_ray_mask_path_override is None:
-        neutral_face_ray_mask_path = ava256_output_root / capture_id / neutral["frame_id"] / "face_ray_mask.json"
-        if neutral_face_ray_mask_path.exists():
-            face_ray_mask_path_override = neutral_face_ray_mask_path
+    # Face mask for skin-augmented wraps (computed by
+    # run_neutral_skin_propagation.py, stored with the neutral frame's
+    # outputs): the neutral frame uses face_ray_mask.json; every other frame
+    # uses its expression's / segment's face_ray_mask_<seg_id>.json (built the
+    # same way on the segment's first frame). An explicit --face-ray-mask-path
+    # still wins.
+    neutral_dir = ava256_output_root / capture_id / neutral["frame_id"]
+    if is_neutral_frame:
+        expected_mask_path = neutral_dir / "face_ray_mask.json"
+    else:
+        seg_id = landmark_sam_filter.segment_of_frame(actor_dir, frame_id)
+        expected_mask_path = landmark_sam_filter.segment_face_mask_path(neutral_dir, seg_id or "<unlisted>")
+    if face_ray_mask_path_override is None and expected_mask_path.exists():
+        face_ray_mask_path_override = expected_mask_path
     if include_skin and use_face_ray_masking and face_ray_mask_path_override is None:
+        fix = "--mask-only" if is_neutral_frame else f"--mask-only --segments {seg_id}"
         raise RuntimeError(
-            f"no face mask for {capture_id} ({ava256_output_root / capture_id / neutral['frame_id'] / 'face_ray_mask.json'}) "
-            f"-- run run_neutral_skin_propagation.py (or its --mask-only) for this capture first"
+            f"no face mask for {capture_id}/{frame_id} ({expected_mask_path}) -- run "
+            f"run_neutral_skin_propagation.py {capture_id} {fix} first"
         )
 
     output_dir = ava256_output_root / capture_id / frame_id
@@ -540,22 +536,34 @@ def run_pipeline(
             target_points, missing_indices = _build_propagated_target_correspondence(
                 actor_dir, ava256_landmark_root, capture_id, frame_id, pot_rows, transform_params,
             )
-        # 2.2) Scan-mask landmark filter (skin-augmented wraps with a capture
-        # face mask): drop skin rows whose target lands on a scan face outside
-        # the neutral frame's scan face mask.
+        # 2.2) SAM landmark filter (skin-augmented wraps with a capture face
+        # mask; landmark_sam_filter.py, same rule as Nersemble's: outside the
+        # front cameras' SAM masks, or occluded in all of them) -- standard AND
+        # skin landmarks. The neutral frame uses its own filter
+        # (landmark_filter.json); every other frame uses its expression's /
+        # segment's filter (landmark_filter_<seg_id>.json, computed on the
+        # segment's first frame), both stored with the neutral frame's outputs.
         if include_skin and use_face_ray_masking:
-            scan_mask_path = ava256_output_root / capture_id / neutral["frame_id"] / SCAN_FACE_MASK_NAME
-            if not scan_mask_path.exists():
+            neutral_dir = ava256_output_root / capture_id / neutral["frame_id"]
+            if is_neutral_frame:
+                source = neutral_dir / landmark_sam_filter.LANDMARK_FILTER_NAME
+                dropped = landmark_sam_filter.load_dropped_indices(neutral_dir)
+                fix = "--mask-only"
+            else:
+                seg_id = landmark_sam_filter.segment_of_frame(actor_dir, frame_id)
+                source = landmark_sam_filter.segment_filter_path(neutral_dir, seg_id or "<unlisted>")
+                dropped = landmark_sam_filter.load_segment_dropped_indices(neutral_dir, seg_id) if seg_id else None
+                fix = f"--mask-only --segments {seg_id}"
+            if dropped is None:
                 raise RuntimeError(
-                    f"no scan face mask for {capture_id} ({scan_mask_path}) -- run "
-                    f"run_neutral_skin_propagation.py --mask-only for this capture first"
+                    f"no landmark filter for {capture_id}/{frame_id} ({source}) -- run "
+                    f"run_neutral_skin_propagation.py {capture_id} {fix} first"
                 )
-            scan_mask = set(json.loads(scan_mask_path.read_text(encoding="utf-8")))
-            off_face = _filter_by_scan_mask(target_points, set(missing_indices), verts_world, faces, scan_mask, transform_params)
-            if off_face:
-                print(f"NOTE: {len(off_face)} skin correspondence point(s) land outside the scan face mask "
-                      f"({scan_mask_path.name}) -- excluded from the correspondence map: {off_face}")
-            missing_indices = sorted(set(missing_indices) | set(off_face))
+            dropped = [i for i in dropped if i < len(target_points) and i not in set(missing_indices)]
+            if dropped:
+                print(f"NOTE: {len(dropped)} landmark(s) dropped by the SAM landmark filter ({source.name}) "
+                      f"-- excluded from the correspondence map: {dropped}")
+            missing_indices = sorted(set(missing_indices) | set(dropped))
 
         # 2.3) Same 180 deg X rotation as the scan, then an orientation check.
         target_points = _rotate_targets(target_points, set(missing_indices))
