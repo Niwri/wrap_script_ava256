@@ -425,6 +425,9 @@ def ensure_capture_face_mask(capture_id: str, *, force: bool = False, dry_run: b
     excluded = sorted(set(range(faces.shape[0])) - set(included))
     meta = {"written": time.strftime("%Y-%m-%d %H:%M:%S"), "mask_code_cutoff": MASK_CODE_CUTOFF,
             "neutral_frame": neutral_frame_id, "cameras": sorted(sam_masks),
+            # Front/right/left split on this neutral wrap -- shared by every
+            # expression's mask + filter (ensure_segment_masks).
+            "front_cameras": sorted(front_cams), "right_cameras": sorted(right_cams), "left_cameras": sorted(left_cams),
             "vote_rule": f"front cameras, > {face_ray_masking_ava256.AGREEMENT_FRACTION:.0%} or >= "
                          f"{face_ray_masking_ava256.MIN_AGREEING_CAMERAS} of those seeing a face",
             "wrap_faces_included": len(included), "scan_faces_included": len(scan_included), "scan_faces_total": int(scan_faces.shape[0])}
@@ -448,8 +451,9 @@ def ensure_segment_masks(capture_id: str, *, segments_filter: list[str] | None =
       1. wrap that frame with its skin landmarks and the static
          facescape_mask.txt (no landmark filter, no label change) -- the
          bootstrap wrap the mask is voted on, like the neutral's second wrap;
-      2. classify its front/right/left cameras on that wrap and run ONE SAM
-         pass (nosebridge prompt) on the front cameras;
+      2. run ONE SAM pass (prompted at that frame's own nosebridge, 57) on
+         the capture's NEUTRAL-frame front cameras (face_masks_meta.json) --
+         the same cameras for every expression, not re-classified per frame;
       3. vote FLAME faces on that wrap (face_ray_masking_ava256.
          compute_face_ray_mask) -> face_ray_mask_<seg_id>.json (excluded
          faces, Wrap's FaceMask input) + face_ray_mask_<seg_id>_included.json;
@@ -460,7 +464,7 @@ def ensure_segment_masks(capture_id: str, *, segments_filter: list[str] | None =
     All stored with the neutral frame's outputs; run_pipeline.py uses them for
     every non-neutral frame of the segment. Existing segment outputs are kept
     unless force. Needs the capture's neutral face masks first (the dynamic
-    transform + neutral wrap). Returns {seg_id: dropped landmark indices}."""
+    transform, neutral wrap and its camera classification). Returns {seg_id: dropped landmark indices}."""
     import face_ray_masking_ava256
     import face_ray_masking_ava256_mesh
     import landmark_sam_filter
@@ -509,6 +513,18 @@ def ensure_segment_masks(capture_id: str, *, segments_filter: list[str] | None =
         pot_rows = json.load(f)
     pot_rows_by_index = dict(enumerate(pot_rows))
 
+    # The neutral frame's camera classification, shared by every expression.
+    meta_path = output_dir / "face_masks_meta.json"
+    if not meta_path.exists():
+        raise RuntimeError(f"no neutral face masks for {capture_id} ({meta_path}) -- ensure_capture_face_mask first")
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    # Masks made before the classification was stored: their SAM cameras ARE
+    # the neutral front cameras (minus any without an image).
+    front_cams = set(meta.get("front_cameras") or meta["cameras"])
+    right_cams, left_cams = set(meta.get("right_cameras", [])), set(meta.get("left_cameras", []))
+    front_ids = [c for c in camera_ids if c in front_cams]
+    print(f"{capture_id}: expressions use the neutral frame's {len(front_ids)} front camera(s): {front_ids}")
+
     def write_json(name: str, data) -> None:
         tmp_path = output_dir / f"{name}.tmp"
         tmp_path.write_text(json.dumps(data), encoding="utf-8")
@@ -529,10 +545,8 @@ def ensure_segment_masks(capture_id: str, *, segments_filter: list[str] | None =
         verts_world = dynamic_transform.untransform(np.asarray(mesh.vertices, dtype=np.float64), transform_params)
         faces = np.asarray(mesh.faces, dtype=np.int64)
 
-        # 2) Cameras + one SAM pass on the front cameras (nosebridge prompt).
-        front_cams, right_cams, left_cams = face_ray_masking_ava256.classify_front_right_left(
-            verts_world, faces, pot_rows_by_index, camera_ids, camera_params)
-        front_ids = [c for c in camera_ids if c in front_cams]
+        # 2) One SAM pass on the neutral frame's front cameras, prompted at this
+        #    frame's own nosebridge (57).
         nosebridge_xyz = mesh_utils.pot_row_world_xyz(verts_world, faces, pot_rows_by_index[57])
         try:
             sam_masks = face_ray_masking_ava256_mesh.compute_sam_masks(
