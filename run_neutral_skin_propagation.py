@@ -382,9 +382,14 @@ def ensure_capture_face_mask(capture_id: str, *, force: bool = False, dry_run: b
     # and the scan mask.
     front_ids = [c for c in camera_ids if c in front_cams]
     print(f"{capture_id}: {len(front_ids)} front camera(s) vote: {front_ids}")
-    nosebridge_xyz = mesh_utils.pot_row_world_xyz(verts_world, faces, pot_rows_by_index[57])
+    # SAM prompt: nosebridge + lip corners + eyebrow ends + ears on this wrap
+    # (face_ray_masking_ava256_mesh.SAM_PROMPT_INDICES); eyebrows / ears only
+    # where the neutral frame's keypoints_3d has them.
+    prompt_kp_ids = set(mesh_utils.keypoints_3d_by_id(actor_dir, neutral_frame_id))
+    print(f"{capture_id}: SAM prompt landmarks {face_ray_masking_ava256_mesh.sam_prompt_indices(prompt_kp_ids)}")
     sam_masks = face_ray_masking_ava256_mesh.compute_sam_masks(
-        actor_dir, neutral_frame_id, front_ids, camera_params, nosebridge_xyz,
+        actor_dir, neutral_frame_id, front_ids, camera_params,
+        face_ray_masking_ava256_mesh.sam_prompt_xyz(verts_world, faces, pot_rows_by_index, prompt_kp_ids),
     )
     included = face_ray_masking_ava256.compute_face_ray_mask(
         verts_world, faces, actor_dir, neutral_frame_id, camera_ids, camera_params,
@@ -546,11 +551,15 @@ def ensure_segment_masks(capture_id: str, *, segments_filter: list[str] | None =
         faces = np.asarray(mesh.faces, dtype=np.int64)
 
         # 2) One SAM pass on the neutral frame's front cameras, prompted at this
-        #    frame's own nosebridge (57).
-        nosebridge_xyz = mesh_utils.pot_row_world_xyz(verts_world, faces, pot_rows_by_index[57])
+        #    frame's own nosebridge, lip corners, eyebrow ends and ears
+        #    (face_ray_masking_ava256_mesh.SAM_PROMPT_INDICES; eyebrows / ears
+        #    only where this frame's keypoints_3d has them).
+        prompt_kp_ids = set(mesh_utils.keypoints_3d_by_id(actor_dir, frame_id))
+        print(f"{tag}: SAM prompt landmarks {face_ray_masking_ava256_mesh.sam_prompt_indices(prompt_kp_ids)}")
         try:
             sam_masks = face_ray_masking_ava256_mesh.compute_sam_masks(
-                actor_dir, frame_id, front_ids, camera_params, nosebridge_xyz)
+                actor_dir, frame_id, front_ids, camera_params,
+                face_ray_masking_ava256_mesh.sam_prompt_xyz(verts_world, faces, pot_rows_by_index, prompt_kp_ids))
         except RuntimeError as exc:
             print(f"FAIL {tag}: {exc} -- no face mask / filter")
             continue

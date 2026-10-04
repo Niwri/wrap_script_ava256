@@ -40,6 +40,41 @@ import camera_selection
 import camera_utils
 import face_ray_masking_ava256 as frm
 
+# SAM's positive point prompts, as landmark (POT row) indices on the frame's
+# wrap: nosebridge (57), outer eyebrow ends (30 left, 47 right), lip corners
+# (18 left, 37 right) and ears (1, 4, 6, 14 -- the ear points with a
+# keypoints_3d source; 2/9 have none). A single nosebridge point is ambiguous
+# -- on some actors (e.g. 20220307--1342--RGA575) SAM returns just the nose --
+# so the extra points anchor the mask to the whole face.
+SAM_PROMPT_INDICES = (57, 30, 47, 18, 37, 1, 4, 6, 14)
+# Eyebrow and ear prompts are only used when the frame's keypoints_3d has that
+# landmark's keypoint (a missing ear is usually hidden by hair or turned away).
+KEYPOINTS_3D_GATED_PROMPT_INDICES = frozenset((30, 47, 1, 4, 6, 14))
+
+
+def sam_prompt_indices(keypoints_3d_ids=None) -> list[int]:
+    """SAM_PROMPT_INDICES minus the gated (eyebrow / ear) ones whose keypoint
+    is not in keypoints_3d_ids (the frame's present keypoints_3d ids); no
+    gating when keypoints_3d_ids is None."""
+    import landmark_map
+
+    if keypoints_3d_ids is None:
+        return list(SAM_PROMPT_INDICES)
+    ids = set(keypoints_3d_ids)
+    return [i for i in SAM_PROMPT_INDICES
+            if i not in KEYPOINTS_3D_GATED_PROMPT_INDICES or landmark_map.STANDARD_INDEX_TO_KEYPOINT3D_ID.get(i) in ids]
+
+
+def sam_prompt_xyz(verts_world: np.ndarray, faces: np.ndarray, pot_rows_by_index: dict,
+                   keypoints_3d_ids=None) -> np.ndarray:
+    """(N, 3) world positions of the SAM prompt landmarks on a wrap
+    (sam_prompt_indices(keypoints_3d_ids))."""
+    import mesh_utils
+
+    return np.stack([mesh_utils.pot_row_world_xyz(verts_world, faces, pot_rows_by_index[i])
+                     for i in sam_prompt_indices(keypoints_3d_ids)])
+
+
 AGREEMENT_FRACTION = frm.AGREEMENT_FRACTION
 MIN_AGREEING_CAMERAS = frm.MIN_AGREEING_CAMERAS
 MASK_EROSION_ITERATIONS = frm.MASK_EROSION_ITERATIONS
@@ -53,9 +88,10 @@ def compute_sam_masks(
     anchor_xyz: np.ndarray,
 ) -> dict[str, np.ndarray]:
     """camera_id -> full-resolution 0/1 SAM face mask (cameras without an image
-    for this frame are left out). anchor_xyz: the nosebridge point (standard
-    index 57) in world space, used as each camera's SAM point prompt -- same
-    as compute_face_ray_mask()'s own prompt."""
+    for this frame are left out). anchor_xyz: world-space SAM point prompt(s),
+    one (3,) point or an (N, 3) array -- the pipeline passes sam_prompt_xyz()
+    (nosebridge, eyebrow ends, lip corners). Every point that projects inside
+    a camera's image is a positive prompt for that camera."""
     masks: dict[str, np.ndarray] = {}
     for cam_id in camera_ids:
         try:
@@ -66,9 +102,10 @@ def compute_sam_masks(
         seg_h, seg_w = max(1, h // 2), max(1, w // 2)
         seg_input = cv2.resize(image, (seg_w, seg_h), interpolation=cv2.INTER_AREA)
         K, Rt = camera_params[cam_id]
-        px, py = camera_utils.project_points(np.asarray(anchor_xyz, dtype=np.float64)[None, :], K, Rt)[0]
-        hint = (int(round(px * seg_w / w)), int(round(py * seg_h / h)))
-        hints = [hint] if 0 <= hint[0] < seg_w and 0 <= hint[1] < seg_h else []
+        anchors = np.asarray(anchor_xyz, dtype=np.float64).reshape(-1, 3)
+        hints = [(int(round(px * seg_w / w)), int(round(py * seg_h / h)))
+                 for px, py in camera_utils.project_points(anchors, K, Rt)]
+        hints = [p for p in hints if 0 <= p[0] < seg_w and 0 <= p[1] < seg_h]
         mask = frm._get_face_mask(seg_input, point_hints=hints).astype(np.uint8)
         n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
         if n_labels > 1:
