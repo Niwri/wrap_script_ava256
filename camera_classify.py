@@ -10,6 +10,16 @@ from __future__ import annotations
 import numpy as np
 
 FRONT_ANGLE_THRESHOLD_DEG = 35.0  # camera-to-centroid direction within this of "true front" -> FRONT weight
+# When fewer than MIN_FRONT_CAMERAS pass the angle test (the undernose normal
+# can tilt far toward the chin, e.g. 20220315--0818--HDZ165: 1 front camera,
+# 401071 from below), DEFAULT_FRONT_CAMERAS -- the front set classified on
+# 20210810--1306--FXN596's neutral frame (050257) -- is used instead, limited
+# to the cameras this capture has.
+MIN_FRONT_CAMERAS = 7
+DEFAULT_FRONT_CAMERAS = frozenset({
+    "400944", "401071", "401075", "401163", "401166", "401168", "401172", "401175", "401292",
+    "401303", "401305", "401312", "401452", "401458", "401459", "401463", "401469",
+})
 
 
 def classify_front_right_left(
@@ -64,4 +74,12 @@ def classify_front_right_left(
             right.add(cam_id)
         else:
             left.add(cam_id)
+    if len(front) < MIN_FRONT_CAMERAS:
+        fallback = DEFAULT_FRONT_CAMERAS & set(camera_ids)
+        if len(fallback) > len(front):
+            print(f"NOTE: only {len(front)} front camera(s) by angle ({sorted(front)}) -- using the "
+                  f"{len(fallback)} default front cameras (FXN596's) instead")
+            front = set(fallback)
+            right -= front
+            left -= front
     return front, right, left
