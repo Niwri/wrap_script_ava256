@@ -17,10 +17,11 @@ rule, for one frame:
   - It votes "inside" when the landmark is inside the SAM mask, or within
     MASK_MARGIN_MM of it (converted to pixels per landmark: fx * mm / depth).
     MASK_MARGIN_MM is 0: no boundary allowance, unlike Nersemble's 30 px.
-  - Kept when at least MIN_AGREEING_CAMERAS (1) of the voting cameras have
-    it inside their SAM mask (the "> AGREEMENT_FRACTION of the voting
-    cameras" alternative is then implied); dropped when no voting camera has
-    it inside -- including when it's occluded / off-image in every camera.
+  - Kept when at least AGREEMENT_FRACTION (50%) of the voting cameras have
+    it inside their SAM mask (was: any single camera, which let landmarks on
+    hair through on one oblique camera whose SAM mask leaked into the hair);
+    dropped otherwise -- including when it's occluded / off-image in every
+    camera.
   - NEVER_FILTERED_INDICES (eyelids + lips, nosebridge, undernose) are always
     kept; ears and everything else are filtered.
 
@@ -39,8 +40,8 @@ import landmark_map
 LANDMARK_FILTER_NAME = "landmark_filter.json"
 MASK_MARGIN_MM = 0.0  # no boundary allowance (was 4.5 mm)
 OCCLUSION_TOLERANCE_MM = 10.0
-AGREEMENT_FRACTION = 0.5
-MIN_AGREEING_CAMERAS = 1  # one camera seeing it inside its SAM mask is enough (was 3)
+AGREEMENT_FRACTION = 0.5  # kept when >= this fraction of the cameras that see it have it inside their SAM mask
+# (was: > 50% OR at least 1 camera -- i.e. any single camera -- and before that >= 3 cameras)
 _groups = landmark_map.AVA256_STANDARD_INDEX_REGION_GROUPS
 NEVER_FILTERED_INDICES = frozenset(_groups["eyelid_lip"]) | frozenset(_groups["nosebridge"]) | frozenset(_groups["undernose"])
 
@@ -158,7 +159,7 @@ def passes(v: dict[str, list[str]]) -> bool:
     n_in, n_seen = len(v["inside"]), len(v["inside"]) + len(v["outside"])
     if n_seen == 0:
         return False  # occluded / off-image in every camera (e.g. an ear behind hair)
-    return n_in / n_seen > AGREEMENT_FRACTION or n_in >= MIN_AGREEING_CAMERAS
+    return n_in / n_seen >= AGREEMENT_FRACTION
 
 
 def compute_landmark_filter(targets: dict[int, np.ndarray], sam_masks: dict[str, np.ndarray],
@@ -172,5 +173,5 @@ def compute_landmark_filter(targets: dict[int, np.ndarray], sam_masks: dict[str,
         "kept": kept, "dropped": dropped, "votes": {str(i): v for i, v in votes.items()},
         "never_filtered": sorted(NEVER_FILTERED_INDICES), "cameras": sorted(sam_masks),
         "rule": {"mask_margin_mm": MASK_MARGIN_MM, "occlusion_tolerance_mm": OCCLUSION_TOLERANCE_MM,
-                 "agreement_fraction": AGREEMENT_FRACTION, "min_agreeing_cameras": MIN_AGREEING_CAMERAS},
+                 "agreement_fraction": AGREEMENT_FRACTION, "agreement_inclusive": True},
     }

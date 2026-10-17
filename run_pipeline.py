@@ -392,6 +392,7 @@ def run_pipeline(
     dry_run: bool = False,
     force: bool = False,
     mark_unconfirmed: bool = True,
+    recompute_scale: bool = False,
 ) -> Path:
     """Wraps one frame of a capture (CPU only: Wrap + numpy). Face ray
     masking is not done here: a skin-augmented wrap (include_skin, masking on)
@@ -491,12 +492,26 @@ def run_pipeline(
         # the NEUTRAL frame's own scan bbox, and reused for every other frame.
         verts_world, faces = mesh_utils.build_world_mesh(actor_dir, frame_id, ava256_mesh_topology_path)
         transform_params_path = dynamic_transform.params_path(ava256_output_root, capture_id)
-        if transform_params_path.exists():
+        if transform_params_path.exists() and not (recompute_scale and is_neutral_frame):
             transform_params = dynamic_transform.load_params(transform_params_path)
         elif is_neutral_frame:
-            transform_params = dynamic_transform.compute_params(default_neutral_mesh_path, verts_world)
+            # Face-based ("face_p5") scale from this neutral frame's keypoints_3d
+            # (brow-chin vertical, outer eye corners horizontal -- see
+            # dynamic_transform's docstring); the bbox scale only when those
+            # keypoints are missing.
+            transform_params = dynamic_transform.compute_face_params(
+                default_neutral_mesh_path, _load_template_pot(template_pot_path),
+                mesh_utils.keypoints_3d_by_id(actor_dir, frame_id), verts_world)
+            if transform_params is None:
+                print(f"NOTE: {capture_id}/{frame_id}: keypoints_3d lacks a brow / chin / outer eye corner point -- "
+                      "falling back to the bbox scale")
+                transform_params = dynamic_transform.compute_params(default_neutral_mesh_path, verts_world)
+                transform_params["method"] = np.array("bbox")
+            print(f"Scale {capture_id}: {str(transform_params['method'])} -> {transform_params_path}"
+                  + (" (recomputed: redo this capture's propagation and masks)" if recompute_scale else ""))
             if not dry_run:
                 dynamic_transform.save_params(transform_params_path, transform_params)
+            transform_params = {**transform_params, "method": str(transform_params["method"])}
         else:
             raise RuntimeError(
                 f"No dynamic_transform_params.npz for {capture_id} yet -- wrap the neutral frame "
@@ -695,6 +710,10 @@ def main() -> int:
                          help="Re-wrap even if this frame/phase already succeeded (skips the label_tracker.json / "
                               "wrapped_mesh.obj-existence idempotency check)")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--recompute-scale", action="store_true",
+                        help="Neutral frame only: recompute and overwrite the capture's dynamic_transform_params.npz "
+                             "(face-based scale) even if one exists. Every wrap, the propagated skin landmarks and the "
+                             "masks of the capture depend on it -- rerun its propagation and wraps afterwards.")
     parser.add_argument("--no-mark-unconfirmed", action="store_true",
                         help="Don't move the capture to 'unconfirmed' after a skin wrap (run_pipeline_batch.py marks it after all frames)")
     args = parser.parse_args()
@@ -732,6 +751,7 @@ def main() -> int:
         dry_run=args.dry_run,
         force=args.force,
         mark_unconfirmed=not args.no_mark_unconfirmed,
+        recompute_scale=args.recompute_scale,
     )
     print(f"Wrapped mesh at {output_path}")
     return 0

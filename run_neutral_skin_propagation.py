@@ -447,6 +447,78 @@ def ensure_capture_face_mask(capture_id: str, *, force: bool = False, dry_run: b
     return True
 
 
+_raft_for_segment_masks = None  # loaded on first use (process_capture frees its own RAFT before the masks)
+# The checkpoint it loads: process_capture() sets this from its raft_checkpoint_path (--raft-checkpoint-path,
+# passed by run_neutral_propagation*.sh), so the segment-mask frame choice uses the same model file as propagation.
+_raft_checkpoint_for_segment_masks = DEFAULTS["raft_checkpoint_path"]
+
+
+def closest_segment_frame_to_neutral(actor_dir: Path, neutral_frame_id: str, candidates: list[str],
+                                     front_ids: list[str], camera_params: dict) -> tuple[str, str]:
+    """(frame_id, how): the candidate frame closest to the neutral frame, by the
+    same test as Nersemble's expression masks (wrap_script/run_neutral_cotracker_
+    propagation.py: closest_scan_frame_to_neutral / _find_anchor_frame): RAFT
+    flow neutral -> frame and back, sampled at the neutral frame's standard
+    landmarks (keypoints_3d, projected), on the neutral frame's most frontal
+    front camera; the frame whose worst point has the smallest round-trip
+    error wins. Falls back to the first candidate ("first") when there is only
+    one, or no camera / image / landmark to test with."""
+    global _raft_for_segment_masks
+    if len(candidates) <= 1:
+        return candidates[0], "first"
+    kp = mesh_utils.keypoints_3d_by_id(actor_dir, neutral_frame_id)
+    pts = {i: np.asarray(kp[k], dtype=np.float64) for i, k in landmark_map.STANDARD_INDEX_TO_KEYPOINT3D_ID.items() if k in kp}
+    if not all(i in pts for i in (*dynamic_transform.BROW_INDICES, dynamic_transform.CHIN_INDEX, *dynamic_transform.OUTER_EYE_CORNERS)):
+        return candidates[0], "first (neutral keypoints_3d incomplete)"
+    R, _, _ = dynamic_transform._face_frame(pts)
+    brow = np.mean([pts[i] for i in dynamic_transform.BROW_INDICES], axis=0)
+
+    def frontalness(cam_id: str) -> float:
+        v = camera_utils.camera_center_world(camera_params[cam_id][1]) - brow
+        return float(v @ R[2] / np.linalg.norm(v))
+
+    neutral_img, cam = None, None
+    for cam_id in sorted(front_ids, key=frontalness, reverse=True):
+        try:
+            neutral_img = camera_utils.load_image(actor_dir, cam_id, neutral_frame_id)
+            cam = cam_id
+            break
+        except (KeyError, FileNotFoundError):
+            continue
+    if cam is None:
+        return candidates[0], "first (no neutral image)"
+    K, Rt = camera_params[cam]
+    h, w = neutral_img.shape[:2]
+    small_w, small_h = max(8, round(w * RAFT_DOWNSCALE)), max(8, round(h * RAFT_DOWNSCALE))
+    sx, sy = small_w / w, small_h / h
+    query = camera_utils.project_points(np.stack(list(pts.values())), K, Rt) * [sx, sy]
+    query = query[(query[:, 0] >= 0) & (query[:, 0] < small_w) & (query[:, 1] >= 0) & (query[:, 1] < small_h)]
+    if not len(query):
+        return candidates[0], "first (no landmark in view)"
+    if _raft_for_segment_masks is None:
+        _raft_for_segment_masks = load_raft_model(_raft_checkpoint_for_segment_masks)
+    small = lambda img: np.array(Image.fromarray(img).resize((small_w, small_h), Image.BILINEAR))  # noqa: E731
+    n_small = small(neutral_img)
+    errors: dict[str, float] = {}
+    for frame_id in candidates:
+        try:
+            f_small = small(camera_utils.load_image(actor_dir, cam, frame_id))
+        except (KeyError, FileNotFoundError):
+            continue
+        fwd = _raft_flow(_raft_for_segment_masks, n_small, f_small)
+        bwd = _raft_flow(_raft_for_segment_masks, f_small, n_small)
+        worst = 0.0
+        for x, y in query:
+            dx, dy = _sample_flow_bilinear(fwd, x, y)
+            bx, by = _sample_flow_bilinear(bwd, x + dx, y + dy)
+            worst = max(worst, float(np.hypot(dx + bx, dy + by)))
+        errors[frame_id] = worst
+    if not errors:
+        return candidates[0], "first (no candidate image)"
+    best = min(errors, key=errors.get)
+    return best, f"raft_closest (cam {cam}, round-trip {errors[best] / RAFT_DOWNSCALE:.1f} px)"
+
+
 def ensure_segment_masks(capture_id: str, *, segments_filter: list[str] | None = None, force: bool = False,
                          dry_run: bool = False, **wrap_kwargs) -> dict[str, list[int]]:
     """Per-expression face mask + SAM landmark filter, built the same way as
@@ -493,10 +565,12 @@ def ensure_segment_masks(capture_id: str, *, segments_filter: list[str] | None =
                    landmark_sam_filter.segment_face_mask_path(output_dir, seg_id))
         if all(p.exists() for p in outputs) and not force:
             continue
-        first = next((f for f in frames
-                      if f != neutral_frame_id and next(capture_landmark_dir.glob(f"*_{f}.json"), None)), None)
-        if first:
-            todo[seg_id] = first
+        # Candidates: the segment's frames with propagated landmarks; the one
+        # closest to the neutral frame is picked below (closest_segment_frame_to_neutral).
+        candidates = [f for f in frames
+                      if f != neutral_frame_id and next(capture_landmark_dir.glob(f"*_{f}.json"), None)]
+        if candidates:
+            todo[seg_id] = candidates
     if not todo:
         print(f"NOTE: {capture_id}: per-segment face masks / landmark filters up to date (or no propagated frames)")
         return {}
@@ -529,6 +603,15 @@ def ensure_segment_masks(capture_id: str, *, segments_filter: list[str] | None =
     right_cams, left_cams = set(meta.get("right_cameras", [])), set(meta.get("left_cameras", []))
     front_ids = [c for c in camera_ids if c in front_cams]
     print(f"{capture_id}: expressions use the neutral frame's {len(front_ids)} front camera(s): {front_ids}")
+
+    # Each segment's mask frame: the candidate closest to the neutral frame
+    # (RAFT forward-backward round trip, like Nersemble's expression masks).
+    selection: dict[str, tuple[str, str, int]] = {}
+    for seg_id, candidates in list(todo.items()):
+        frame_id, how = closest_segment_frame_to_neutral(actor_dir, neutral_frame_id, candidates, front_ids, camera_params)
+        selection[seg_id] = (frame_id, how, len(candidates))
+        todo[seg_id] = frame_id
+        print(f"{capture_id}/{seg_id}: mask frame {frame_id} ({how}, {len(candidates)} candidate(s))")
 
     def write_json(name: str, data) -> None:
         tmp_path = output_dir / f"{name}.tmp"
@@ -579,7 +662,8 @@ def ensure_segment_masks(capture_id: str, *, segments_filter: list[str] | None =
             np.array([[target_points[i]["x"], target_points[i]["y"], target_points[i]["z"]] for i in idx]), transform_params)
         scan_verts, scan_faces = mesh_utils.build_world_mesh(actor_dir, frame_id, Path(wrap_kwargs["ava256_mesh_topology_path"]))
         payload = landmark_sam_filter.compute_landmark_filter(dict(zip(idx, world)), sam_masks, camera_params, scan_verts, scan_faces)
-        payload.update({"segment": seg_id, "frame_id": frame_id, "neutral_frame": neutral_frame_id})
+        payload.update({"segment": seg_id, "frame_id": frame_id, "neutral_frame": neutral_frame_id,
+                        "selection": selection[seg_id][1], "n_candidates": selection[seg_id][2]})
 
         mask_path = landmark_sam_filter.segment_face_mask_path(output_dir, seg_id)
         write_json(mask_path.name, excluded)
@@ -589,8 +673,10 @@ def ensure_segment_masks(capture_id: str, *, segments_filter: list[str] | None =
         print(f"{tag}: face mask {len(included)} included / {len(excluded)} excluded faces ({len(sam_masks)} front "
               f"cameras); landmark filter kept {len(payload['kept'])}, dropped {len(payload['dropped'])}: {payload['dropped']}")
 
+    global _raft_for_segment_masks
     face_ray_masking_ava256._bg_segmenter = None
     face_ray_masking_ava256._face_segmenter = None
+    _raft_for_segment_masks = None
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return written
@@ -627,7 +713,10 @@ def process_capture(
     dry_run: bool = False,
     force: bool = False,
     mask_only: bool = False,
+    recompute_scale: bool = False,
 ) -> None:
+    global _raft_checkpoint_for_segment_masks
+    _raft_checkpoint_for_segment_masks = raft_checkpoint_path
     wrap_kwargs = dict(
         ava256_data_root=ava256_data_root, ava256_landmark_root=ava256_landmark_root,
         ava256_output_root=ava256_output_root, label_tracker_path=label_tracker_path,
@@ -684,8 +773,11 @@ def process_capture(
         neutral_frame_id = neutral["frame_id"]
 
         wrapped_mesh_path = ava256_output_root / capture_id / neutral_frame_id / "wrapped_mesh.obj"
-        if not wrapped_mesh_path.exists():
-            print(f"Wrapping {capture_id}/{neutral_frame_id} first (bootstrap, missing {wrapped_mesh_path})...")
+        if recompute_scale or not wrapped_mesh_path.exists():
+            # recompute_scale: the bootstrap is redone with a freshly computed
+            # (face-based) scale, since the skin seeds below come from it.
+            print(f"Wrapping {capture_id}/{neutral_frame_id} first (bootstrap, "
+                  + ("recomputing the scale" if recompute_scale else f"missing {wrapped_mesh_path}") + ")...")
             wrap_pipeline(
                 capture_id,
                 ava256_data_root=ava256_data_root,
@@ -706,6 +798,8 @@ def process_capture(
                 facescape_run_pipeline_path=facescape_run_pipeline_path,
                 include_skin=False,
                 dry_run=dry_run,
+                force=recompute_scale,
+                recompute_scale=recompute_scale,
             )
             if not dry_run and not wrapped_mesh_path.exists():
                 print(f"FAIL {capture_id}: {wrapped_mesh_path} still missing after bootstrap wrap")
@@ -963,7 +1057,13 @@ def main() -> int:
     parser.add_argument("--mask-only", action="store_true",
                         help="Only re-wrap the neutral frame with its skin landmarks and compute the capture's face "
                              "mask (for captures already propagated); no propagation, no label change")
+    parser.add_argument("--recompute-scale", action="store_true",
+                        help="Recompute the capture's dynamic_transform_params.npz (face-based scale) and redo the "
+                             "bootstrap neutral wrap with it before propagating (use with --force on an already "
+                             "propagated capture). Not combined with --mask-only.")
     args = parser.parse_args()
+    if args.recompute_scale and args.mask_only:
+        parser.error("--recompute-scale needs a full propagation (the skin seeds come from the bootstrap wrap); drop --mask-only")
 
     process_capture(
         args.capture_id,
@@ -995,6 +1095,7 @@ def main() -> int:
         dry_run=args.dry_run,
         force=args.force,
         mask_only=args.mask_only,
+        recompute_scale=args.recompute_scale,
     )
     return 0
 

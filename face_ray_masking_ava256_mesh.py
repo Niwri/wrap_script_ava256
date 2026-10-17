@@ -41,12 +41,14 @@ import camera_utils
 import face_ray_masking_ava256 as frm
 
 # SAM's positive point prompts, as landmark (POT row) indices on the frame's
-# wrap: nosebridge (57), outer eyebrow ends (30 left, 47 right), lip corners
-# (18 left, 37 right) and ears (1, 4, 6, 14 -- the ear points with a
-# keypoints_3d source; 2/9 have none). A single nosebridge point is ambiguous
-# -- on some actors (e.g. 20220307--1342--RGA575) SAM returns just the nose --
-# so the extra points anchor the mask to the whole face.
-SAM_PROMPT_INDICES = (57, 30, 47, 18, 37, 1, 4, 6, 14)
+# wrap: nosebridge (57), lip corners (18 left, 37 right) and one point per ear
+# (1, 6). A single nosebridge point is ambiguous -- on some actors (e.g.
+# 20220307--1342--RGA575) SAM returns just the nose -- so the extra points
+# anchor the mask to the whole face. The outer eyebrow ends (30, 47) and the
+# other ear points (4, 14) were dropped (2026-10-09): on actors with bangs /
+# hair at the temples they sit on hair and pull SAM's mask over the whole head
+# (tested on 20230810--0812--OXS375).
+SAM_PROMPT_INDICES = (57, 18, 37, 1, 6)
 # Eyebrow and ear prompts are only used when the frame's keypoints_3d has that
 # landmark's keypoint (a missing ear is usually hidden by hair or turned away).
 KEYPOINTS_3D_GATED_PROMPT_INDICES = frozenset((30, 47, 1, 4, 6, 14))
