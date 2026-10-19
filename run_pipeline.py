@@ -543,6 +543,16 @@ def run_pipeline(
                 include_skin=include_skin, prior_wrap_verts=prior_wrap_verts, faces=flame_faces,
                 transform_params=transform_params,
             )
+            # Forehead shift (forehead_shift.py): the forehead skin targets come from the capture's
+            # forehead_shift.json (shifted down over the bootstrap wrap) instead of the prior wrap.
+            if include_skin:
+                import forehead_shift
+                shift = forehead_shift.load(output_dir)
+                if shift:
+                    target_points = forehead_shift.override_targets(
+                        target_points, shift, lambda pts: dynamic_transform.transform(pts, transform_params))
+                    print(f"Forehead shift ({forehead_shift.SHIFT_NAME}, {shift.get('status')}, d={shift['d']:.4f}): "
+                          f"targets of rows {sorted(int(i) for i in shift['points_world'])} taken from it")
         else:
             # Non-neutral expression frame: keypoints_3d has no per-frame
             # skin ground truth, so both standard and skin rows come from

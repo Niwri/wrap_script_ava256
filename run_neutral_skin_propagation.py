@@ -31,6 +31,7 @@ import csv
 import fcntl
 import importlib.util
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -48,6 +49,7 @@ import mesh_utils
 import camera_utils
 import camera_selection
 import dynamic_transform
+import forehead_shift
 from label_tracker_ava256 import Ava256LabelTracker, ensure_label_tracker_file
 from run_pipeline import run_pipeline as wrap_pipeline, DEFAULTS as PIPELINE_DEFAULTS, _load_wrap_script
 
@@ -396,6 +398,11 @@ def ensure_capture_face_mask(capture_id: str, *, force: bool = False, dry_run: b
         front_cams, right_cams, left_cams, pot_rows_by_index=pot_rows_by_index,
         precomputed_masks=sam_masks,
     )
+    # Forehead slope filter (forehead_filter.py): forehead-band faces that bulge forward onto the hair on this
+    # wrap leave the mask; the skin targets on their vertices are dropped with the landmark filter below.
+    import forehead_filter
+    forehead = forehead_filter.flag_faces(verts_world, faces, included)
+    included = sorted(set(int(f) for f in included) - set(forehead["removed"]))
     scan_verts_world, scan_faces = mesh_utils.build_world_mesh(
         actor_dir, neutral_frame_id, Path(wrap_kwargs["ava256_mesh_topology_path"]),
     )
@@ -418,6 +425,10 @@ def ensure_capture_face_mask(capture_id: str, *, force: bool = False, dry_run: b
             targets[i] = mesh_utils.pot_row_world_xyz(verts_world, faces, pot_rows_by_index[i])
     landmark_filter = landmark_sam_filter.compute_landmark_filter(
         targets, sam_masks, camera_params, scan_verts_world, scan_faces)
+    forehead_rows = forehead_filter.targets_on_removed(
+        [pot_rows_by_index[i] for i in range(len(pot_rows_by_index))], faces, forehead["removed"])
+    landmark_filter = forehead_filter.merge_into_landmark_filter(landmark_filter, forehead, forehead_rows)
+    print(f"{capture_id}: {forehead_filter.summary(forehead, forehead_rows)}")
     print(f"{capture_id}: landmark filter kept {len(landmark_filter['kept'])}, dropped "
           f"{len(landmark_filter['dropped'])}: {landmark_filter['dropped']}")
     # Free SAM/U2Net before anything else wants the GPU.
@@ -435,7 +446,8 @@ def ensure_capture_face_mask(capture_id: str, *, force: bool = False, dry_run: b
             "front_cameras": sorted(front_cams), "right_cameras": sorted(right_cams), "left_cameras": sorted(left_cams),
             "vote_rule": f"front cameras, > {face_ray_masking_ava256.AGREEMENT_FRACTION:.0%} or >= "
                          f"{face_ray_masking_ava256.MIN_AGREEING_CAMERAS} of those seeing a face",
-            "wrap_faces_included": len(included), "scan_faces_included": len(scan_included), "scan_faces_total": int(scan_faces.shape[0])}
+            "wrap_faces_included": len(included), "scan_faces_included": len(scan_included), "scan_faces_total": int(scan_faces.shape[0]),
+            "forehead_faces_removed": len(forehead["removed"]), "forehead_targets_dropped": forehead_rows}
     for name, data in (("face_ray_mask.json", excluded), ("face_ray_mask_included.json", sorted(included)),
                        ("scan_face_mask_included.json", scan_included),
                        (landmark_sam_filter.LANDMARK_FILTER_NAME, landmark_filter), ("face_masks_meta.json", meta)):
@@ -542,6 +554,7 @@ def ensure_segment_masks(capture_id: str, *, segments_filter: list[str] | None =
     every non-neutral frame of the segment. Existing segment outputs are kept
     unless force. Needs the capture's neutral face masks first (the dynamic
     transform, neutral wrap and its camera classification). Returns {seg_id: dropped landmark indices}."""
+    import forehead_filter
     import face_ray_masking_ava256
     import face_ray_masking_ava256_mesh
     import landmark_sam_filter
@@ -651,6 +664,9 @@ def ensure_segment_masks(capture_id: str, *, segments_filter: list[str] | None =
         included = face_ray_masking_ava256.compute_face_ray_mask(
             verts_world, faces, actor_dir, frame_id, camera_ids, camera_params,
             front_cams, right_cams, left_cams, pot_rows_by_index=pot_rows_by_index, precomputed_masks=sam_masks)
+        # Forehead slope filter on this frame's wrap, as for the neutral mask (forehead_filter.py).
+        forehead = forehead_filter.flag_faces(verts_world, faces, included)
+        included = sorted(set(int(f) for f in included) - set(forehead["removed"]))
         excluded = sorted(set(range(faces.shape[0])) - set(included))
 
         # 4) Landmark filter on this frame's own targets, same SAM masks.
@@ -662,6 +678,9 @@ def ensure_segment_masks(capture_id: str, *, segments_filter: list[str] | None =
             np.array([[target_points[i]["x"], target_points[i]["y"], target_points[i]["z"]] for i in idx]), transform_params)
         scan_verts, scan_faces = mesh_utils.build_world_mesh(actor_dir, frame_id, Path(wrap_kwargs["ava256_mesh_topology_path"]))
         payload = landmark_sam_filter.compute_landmark_filter(dict(zip(idx, world)), sam_masks, camera_params, scan_verts, scan_faces)
+        forehead_rows = forehead_filter.targets_on_removed(pot_rows, faces, forehead["removed"])
+        payload = forehead_filter.merge_into_landmark_filter(payload, forehead, forehead_rows)
+        print(f"{tag}: {forehead_filter.summary(forehead, forehead_rows)}")
         payload.update({"segment": seg_id, "frame_id": frame_id, "neutral_frame": neutral_frame_id,
                         "selection": selection[seg_id][1], "n_candidates": selection[seg_id][2]})
 
@@ -680,6 +699,62 @@ def ensure_segment_masks(capture_id: str, *, segments_filter: list[str] | None =
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return written
+
+
+def ensure_forehead_shift(capture_id: str, neutral_frame_id: str, wrapped_verts: np.ndarray, wrapped_faces: np.ndarray,
+                          pot_rows: list, transform_params: dict, wrap_kwargs: dict, force: bool = False) -> dict:
+    """The capture's forehead shift (forehead_shift.py), searched once per capture and kept in
+    <output>/<capture>/<neutral>/forehead_shift.json: forehead skin points of the bootstrap wrap moved down over
+    it by d, d found by secant search on trial neutral wraps (skin on, static mask; forehead targets from the
+    trial file, every other skin target from the bootstrap wrap) until the forehead ratio is within
+    forehead_shift.TOLERANCE of forehead_shift.TARGET_RATIO (at most MAX_STEPS wraps; the closest is kept).
+    The bootstrap wrap is restored after every trial. Reused unless `force` or its target differs."""
+    out_dir = Path(wrap_kwargs["ava256_output_root"]) / capture_id / neutral_frame_id
+    existing = forehead_shift.load(out_dir)
+    if (existing and existing.get("status") == "done" and not force
+            and abs(existing.get("target_ratio", -1) - forehead_shift.TARGET_RATIO) < 1e-9):
+        print(f"{capture_id}: forehead shift d={existing['d']:.3f} (ratio {existing['ratio']:.3f}) from {forehead_shift.SHIFT_NAME}")
+        return existing
+    target = forehead_shift.TARGET_RATIO
+    rows = forehead_shift.forehead_rows(pot_rows, wrapped_faces)
+    base_pts = np.stack([mesh_utils.pot_row_world_xyz(wrapped_verts, wrapped_faces, pot_rows[i]) for i in rows])
+    length = forehead_shift.brow_chin_length(wrapped_verts)
+    r0 = forehead_shift.forehead_ratio(wrapped_verts)[0]
+    if r0 <= target:  # down only: a forehead already at or below the target is left as is
+        payload = forehead_shift.no_shift_payload(r0, target); forehead_shift.save(out_dir, payload)
+        print(f"{capture_id}: forehead ratio {r0:.3f} <= target {target:.3f} -- no forehead shift (down only)")
+        return payload
+    bootstrap = out_dir / "wrapped_mesh.obj"; keep = out_dir / "bootstrap_wrapped_mesh.obj"
+    shutil.copy2(bootstrap, keep)
+    history = [(0.0, r0)]; best = None
+    d = forehead_shift.next_distance(history, target, length)
+    print(f"{capture_id}: forehead shift search -- bootstrap ratio {r0:.3f}, target {target:.3f}, rows {rows}")
+    try:
+        for step in range(1, forehead_shift.MAX_STEPS + 1):
+            pts = forehead_shift.shift_down(base_pts, wrapped_verts, wrapped_faces, d)
+            forehead_shift.save(out_dir, {"status": "trial", "d": d, "rows": rows,
+                                          "points_world": {str(i): p.tolist() for i, p in zip(rows, pts)}})
+            wrap_pipeline(capture_id, **wrap_kwargs, include_skin=True, use_face_ray_masking=False,
+                          mark_unconfirmed=False, force=True)
+            mesh = trimesh.load(str(bootstrap), process=False)
+            r = forehead_shift.forehead_ratio(dynamic_transform.untransform(np.asarray(mesh.vertices, dtype=np.float64),
+                                                                            transform_params))[0]
+            shutil.copy2(keep, bootstrap)  # every other skin target comes from the bootstrap wrap
+            history.append((d, r))
+            print(f"{capture_id}: forehead shift step {step}: d={d:.3f} ({d / length:.3f} brow-chin) -> ratio {r:.3f}")
+            if best is None or abs(r - target) < abs(best[1] - target):
+                best = (d, r, pts)
+            if abs(r - target) < forehead_shift.TOLERANCE:
+                break
+            d = forehead_shift.next_distance(history, target, length)
+    finally:
+        shutil.copy2(keep, bootstrap)
+    payload = {"status": "done", "target_ratio": target, "d": best[0], "ratio": best[1], "d_over_brow_chin": best[0] / length,
+               "rows": rows, "points_world": {str(i): p.tolist() for i, p in zip(rows, best[2])},
+               "bootstrap_ratio": r0, "history": history, "computed": time.strftime("%Y-%m-%d %H:%M:%S")}
+    forehead_shift.save(out_dir, payload)
+    print(f"{capture_id}: forehead shift d={best[0]:.3f} -> ratio {best[1]:.3f} (target {target:.3f})")
+    return payload
 
 
 def process_capture(
@@ -860,12 +935,21 @@ def process_capture(
             for cam_id in cams:
                 landmarks_by_camera.setdefault(cam_id, []).append(idx)
 
+        # Forehead shift (forehead_shift.py): forehead skin points moved down over this bootstrap wrap until a
+        # neutral wrap's forehead ratio reaches forehead_shift.TARGET_RATIO; they seed the tracking below (so
+        # every expression frame starts from them) and run_pipeline.py uses them on the neutral frame.
+        forehead = (forehead_shift.load(ava256_output_root / capture_id / neutral_frame_id) if dry_run else
+                    ensure_forehead_shift(capture_id, neutral_frame_id, wrapped_verts, wrapped_faces, pot_rows,
+                                          transform_params, wrap_kwargs, force=recompute_scale))
+        forehead_pts = forehead_shift.shifted_points(forehead)
+
         # Neutral-frame 2D seed per (camera, landmark): projection of the
         # already-known 3D position, not detection -- exact by construction.
         neutral_seed_px: dict[str, dict[int, tuple[float, float]]] = {}
         for cam_id, indices in landmarks_by_camera.items():
             K, Rt = camera_params[cam_id]
-            xyzs = np.array([mesh_utils.pot_row_world_xyz(wrapped_verts, wrapped_faces, pot_rows_by_index[i]) for i in indices])
+            xyzs = np.array([forehead_pts[i] if i in forehead_pts else
+                             mesh_utils.pot_row_world_xyz(wrapped_verts, wrapped_faces, pot_rows_by_index[i]) for i in indices])
             px = camera_utils.project_points(xyzs, K, Rt)
             neutral_seed_px[cam_id] = {idx: (float(px[j, 0]), float(px[j, 1])) for j, idx in enumerate(indices)}
 

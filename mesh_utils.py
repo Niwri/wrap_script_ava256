@@ -254,6 +254,8 @@ def build_live_extended_pot(base_pot_path: Path, neutral_mesh_path: Path) -> Pat
     Ava-256's own cache (see module note above) whenever its row count
     doesn't match today's live skin vertex count -- same idempotent
     staleness check as FaceScape's own ensure_extended_correspondence_files()."""
+    import forehead_shift  # Ava-256-only extra skin rows (local import: forehead_shift is a sibling module)
+    import trimesh
     fs = _facescape_run_pipeline_module()
     skin_vertex_indices = fs.load_skin_vertex_indices()  # pure/read-only -- live assign_global_indices()
 
@@ -263,7 +265,8 @@ def build_live_extended_pot(base_pot_path: Path, neutral_mesh_path: Path) -> Pat
             existing = json.loads(_LIVE_EXTENDED_POT_CACHE.read_text(encoding="utf-8"))
             with Path(base_pot_path).open("r", encoding="utf-8") as f:
                 base_len = len(json.load(f))
-            need_rebuild = len(existing) != base_len + len(skin_vertex_indices)
+            # + forehead_shift.EXTRA_SKIN_VERTICES: Ava-256-only rows appended after the shared skin rows
+            need_rebuild = len(existing) != base_len + len(skin_vertex_indices) + len(forehead_shift.EXTRA_SKIN_VERTICES)
         except (json.JSONDecodeError, OSError):
             need_rebuild = True
 
@@ -271,6 +274,10 @@ def build_live_extended_pot(base_pot_path: Path, neutral_mesh_path: Path) -> Pat
         with Path(base_pot_path).open("r", encoding="utf-8") as f:
             base_pot = json.load(f)
         skin_pot = fs._compute_skin_pot_entries(str(neutral_mesh_path), skin_vertex_indices)  # pure/read-only
+        # Ava-256-only extra skin rows (forehead_shift.EXTRA_SKIN_VERTICES, e.g. vertex 668 = the mirror of skin
+        # landmark 106), after the shared ones so Nersemble/FaceScape skin numbering is unchanged.
+        neutral_faces = np.asarray(trimesh.load(str(neutral_mesh_path), process=False).faces, dtype=np.int64)
+        skin_pot = skin_pot + forehead_shift.extra_pot_rows(neutral_faces)
         combined = base_pot + skin_pot
         lock_path = _LIVE_EXTENDED_POT_CACHE.with_name(_LIVE_EXTENDED_POT_CACHE.name + ".lock")
         with lock_path.open("w") as lock_file:
